@@ -58,11 +58,11 @@ def register_student(roll_number, name, gender, degree, year, branch, section):
     student_dir.mkdir(parents=True, exist_ok=True)
 
     instructions = [
-        "Look STRAIGHT at the camera",
-        "Turn your head slightly LEFT",
-        "Turn your head slightly RIGHT",
-        "Tilt your head slightly UP",
-        "Tilt your head slightly DOWN"
+        "Look STRAIGHT at the camera (Frontal View)",
+        "Turn head GENTLY LEFT (slight angle, max 15 deg)",
+        "Turn head GENTLY RIGHT (slight angle, max 15 deg)",
+        "Tilt head GENTLY UP (slight angle)",
+        "Tilt head GENTLY DOWN (slight angle)"
     ]
 
     # Open camera with DirectShow fallback
@@ -86,13 +86,18 @@ def register_student(roll_number, name, gender, degree, year, branch, section):
             shutil.rmtree(student_dir)
         return False, f"Failed to initialize Face Detection model: {str(e)}"
 
+    from src.anti_spoof import evaluate_face_quality
+    from utils.config import (
+        MIN_FACE_SIZE, MIN_BRIGHTNESS, MAX_BRIGHTNESS,
+        MIN_CONTRAST, MAX_YAW_RATIO
+    )
+
     count = 0
     aborted = False
-    BLUR_THRESHOLD = 65
 
     win_title = "SmartClass Vision - Student Registration Capture"
     cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win_title, 760, 560)
+    cv2.resizeWindow(win_title, 780, 580)
     cv2.setWindowProperty(win_title, cv2.WND_PROP_TOPMOST, 1)
 
     while count < 5:
@@ -112,14 +117,13 @@ def register_student(roll_number, name, gender, degree, year, branch, section):
         h, w = frame.shape[:2]
 
         processed_frame, cropped_faces = detector.detect_faces(frame)
-        is_aligned = False
         captured_crop = None
         quality_passed = False
         quality_msg = ""
-        quality_score = 0
 
         if len(cropped_faces) == 1:
-            fx1, fy1, fx2, fy2 = cropped_faces[0]["coords"]
+            face_item = cropped_faces[0]
+            fx1, fy1, fx2, fy2 = face_item["coords"]
             fw, fh = (fx2 - fx1), (fy2 - fy1)
 
             # Dynamic crop with 30% padding around detected face
@@ -131,55 +135,63 @@ def register_student(roll_number, name, gender, degree, year, branch, section):
             cy2 = min(h, fy2 + int(pad_h * 0.4))
 
             captured_crop = clean_frame[cy1:cy2, cx1:cx2]
+            raw_face_crop = face_item.get("raw_crop", clean_frame[fy1:fy2, fx1:fx2])
+            landmarks = face_item.get("landmarks")
 
             # -------------------------------------------------------------
-            # QUALITY ASSESSMENT ENGINE
+            # UNIFIED QUALITY GATE (Identical to training pipeline)
             # -------------------------------------------------------------
-            # 1. Blur Detection (Laplacian Variance)
-            face_gray = cv2.cvtColor(clean_frame[fy1:fy2, fx1:fx2], cv2.COLOR_BGR2GRAY)
-            blur_val = cv2.Laplacian(face_gray, cv2.CV_64F).var()
-            blur_pass = blur_val >= 80.0
+            q_pass, q_reason, metrics = evaluate_face_quality(
+                raw_face_crop,
+                landmarks=landmarks,
+                min_size=max(MIN_FACE_SIZE, 70),
+                blur_thresh=75.0,
+                min_b=MIN_BRIGHTNESS,
+                max_b=MAX_BRIGHTNESS,
+                min_contrast=MIN_CONTRAST,
+                max_yaw_ratio=MAX_YAW_RATIO
+            )
 
-            # 2. Lighting / Brightness Analysis (Average Luma)
-            avg_brightness = float(np.mean(face_gray))
-            light_pass = (50 <= avg_brightness <= 210)
-
-            # 3. Face Resolution / Distance Check (Min face width)
-            size_pass = fw >= 70 and fh >= 70
-
-            # 4. Center Alignment Check (Face not cut at edges)
             margin = 15
             pos_pass = (fx1 >= margin and fy1 >= margin and fx2 <= (w - margin) and fy2 <= (h - margin))
 
-            # Composite quality determination
-            if not size_pass:
-                quality_msg = "Come Closer: Face too small in frame"
+            sharpness = metrics.get("sharpness", 0.0)
+            brightness = metrics.get("brightness", 0.0)
+            yaw = metrics.get("yaw_ratio", 0.0)
+
+            if not pos_pass:
+                quality_passed = False
                 color = (0, 165, 255)
-            elif not light_pass:
-                if avg_brightness < 45:
-                    quality_msg = "Poor Lighting: Face too dark! Move into better light"
+                quality_msg = "Center your face in camera frame"
+            elif not q_pass:
+                quality_passed = False
+                color = (0, 165, 255)
+                if "BLURRY" in q_reason:
+                    quality_msg = f"Motion blur detected (Sharpness: {int(sharpness)}/75) - Hold Still"
+                elif "LOW_LIGHT" in q_reason:
+                    quality_msg = "Face too dark! Move into better lighting"
+                elif "OVEREXPOSED" in q_reason:
+                    quality_msg = "Face too bright! Avoid harsh direct glare"
+                elif "LOW_CONTRAST" in q_reason:
+                    quality_msg = "Low image contrast. Adjust room light"
+                elif "FACE_EXTREME_ANGLE" in q_reason:
+                    quality_msg = f"Face turned too far (Yaw {yaw:.2f}) - Turn gently towards center"
+                elif "FACE_TOO_SMALL" in q_reason:
+                    quality_msg = "Come closer: Face too small in frame"
                 else:
-                    quality_msg = "Overexposed: Too much harsh light on face"
-                color = (0, 165, 255)
-            elif not blur_pass:
-                quality_msg = f"Motion Blur Detected (Sharpness: {int(blur_val)}/80) - Hold Still!"
-                color = (0, 165, 255)
-            elif not pos_pass:
-                quality_msg = "Center Your Face in Camera Frame"
-                color = (0, 165, 255)
+                    quality_msg = q_reason
             else:
                 quality_passed = True
-                is_aligned = True
                 color = (0, 255, 0)
-                quality_msg = f"PERFECT QUALITY (Sharpness: {int(blur_val)}) - Press 'C' or Spacebar"
+                quality_msg = f"READY: Quality Good (Sharpness: {int(sharpness)}) - Press Space or 'C' to Capture"
 
             # Draw bounding box and quality stats
             cv2.rectangle(processed_frame, (fx1, fy1), (fx2, fy2), color, 3)
             cv2.circle(processed_frame, ((fx1 + fx2) // 2, (fy1 + fy2) // 2), 4, color, -1)
 
             # Quality meter overlay
-            badge_text = f"Sharpness: {int(blur_val)} | Light: {int(avg_brightness)}"
-            cv2.rectangle(processed_frame, (fx1, fy2 + 5), (fx1 + 240, fy2 + 30), (20, 20, 20), -1)
+            badge_text = f"Sharpness: {int(sharpness)} | Light: {int(brightness)} | Yaw: {yaw:.2f}"
+            cv2.rectangle(processed_frame, (fx1, fy2 + 5), (fx1 + 270, fy2 + 30), (20, 20, 20), -1)
             cv2.putText(processed_frame, badge_text, (fx1 + 6, fy2 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255) if quality_passed else (0, 165, 255), 1)
 
@@ -189,57 +201,118 @@ def register_student(roll_number, name, gender, degree, year, branch, section):
             msg = "Multiple faces detected! Only 1 student allowed in frame."
             color = (0, 0, 255)
         else:
-            msg = "Looking for student face... Please face the camera directly"
+            msg = "Looking for student face... Face the camera directly"
             color = (0, 165, 255)
 
         # Header Info Banner
         cv2.rectangle(processed_frame, (0, 0), (w, 58), (20, 20, 20), -1)
         cv2.putText(processed_frame, f"Student: {name} ({roll_number}) | Pose {count + 1}/5", (15, 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-        cv2.putText(processed_frame, f"Pose Instruction: {instructions[count]}", (15, 49),
+        cv2.putText(processed_frame, f"Instruction: {instructions[count]}", (15, 49),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 200), 2)
 
         # Status text in center
         cv2.rectangle(processed_frame, (10, h - 85), (w - 10, h - 50), (20, 20, 20), -1)
         cv2.putText(processed_frame, msg, (20, h - 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, color, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2)
 
         # Footer Hint Banner
         cv2.rectangle(processed_frame, (0, h - 45), (w, h), (15, 15, 15), -1)
-        hint = "Press 'C' or Spacebar to Capture (Green Only)  |  Press 'Q' or ESC to Cancel"
+        hint = "📸 PRESS SPACE OR 'C' TO CAPTURE  |  'Q' or ESC to Cancel"
         cv2.putText(processed_frame, hint, (20, h - 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0) if quality_passed else (180, 180, 180), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
 
         cv2.imshow(win_title, processed_frame)
         key = cv2.waitKey(20) & 0xFF
 
-        is_capture_key = key in (ord('c'), ord('C'), 32, 13)  # 'c', 'C', Space, Enter
-        is_cancel_key = key in (ord('q'), ord('Q'), 27)       # 'q', 'Q', ESC
+        is_capture_key = key in (ord('c'), ord('C'), 32, 13)  # User presses Space, Enter, or C
+        is_cancel_key = key in (ord('q'), ord('Q'), 27)        # 'q', 'Q', ESC
 
         if is_cancel_key:
             aborted = True
             break
-        elif is_capture_key:
-            if not quality_passed:
-                # Disallow capture if photo quality threshold is not met!
-                err_flash = processed_frame.copy()
-                cv2.rectangle(err_flash, (w // 6, h // 3), (5 * w // 6, h // 3 + 80), (0, 0, 180), -1)
-                cv2.putText(err_flash, "PHOTO QUALITY REJECTED!", (w // 6 + 20, h // 3 + 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-                cv2.putText(err_flash, quality_msg, (w // 6 + 20, h // 3 + 65),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 255, 255), 1)
-                cv2.imshow(win_title, err_flash)
-                cv2.waitKey(600)
-            elif captured_crop is not None and captured_crop.size > 0:
+
+        # -------------------------------------------------------------
+        # HUMAN-TRIGGERED CAPTURE WITH AI QUALITY & BIOMETRIC VERIFICATION
+        # -------------------------------------------------------------
+        if is_capture_key:
+            if captured_crop is None or captured_crop.size == 0 or len(cropped_faces) != 1:
+                # No valid single face present when user clicked
+                flash = processed_frame.copy()
+                cv2.rectangle(flash, (w // 8, h // 3), (7 * w // 8, h // 3 + 85), (0, 0, 180), -1)
+                cv2.putText(flash, "NO FACE DETECTED - PLEASE RETAKE", (w // 8 + 20, h // 3 + 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+                cv2.putText(flash, "Ensure your face is clearly centered in camera frame.", (w // 8 + 20, h // 3 + 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 255, 255), 1)
+                cv2.imshow(win_title, flash)
+                cv2.waitKey(850)
+                continue
+
+            # Run full quality analysis on the captured snapshot
+            snap_pass, snap_reason, snap_metrics = evaluate_face_quality(
+                raw_face_crop,
+                landmarks=landmarks,
+                min_size=max(MIN_FACE_SIZE, 70),
+                blur_thresh=75.0,
+                min_b=MIN_BRIGHTNESS,
+                max_b=MAX_BRIGHTNESS,
+                min_contrast=MIN_CONTRAST,
+                max_yaw_ratio=MAX_YAW_RATIO
+            )
+
+            # Test biometric detectability with ArcFace ONNX neural network
+            biometric_verified = False
+            if snap_pass and pos_pass:
+                try:
+                    from src.recognizer import FaceRecognizer
+                    rec_inst = FaceRecognizer()
+                    emb = rec_inst._extract_embedding(captured_crop)
+                    if emb is not None and len(emb) == 512:
+                        biometric_verified = True
+                except Exception:
+                    biometric_verified = False
+
+            if snap_pass and pos_pass and biometric_verified:
+                # Image quality is high and verified for attendance recognition -> ACCEPT!
                 img_path = student_dir / f"{roll_number}_{count}.jpg"
                 cv2.imwrite(str(img_path), captured_crop)
                 count += 1
-                # Visual feedback on capture
+
+                # Visual confirmation
                 flash = processed_frame.copy()
-                cv2.putText(flash, f"Pose {count}/5 CAPTURED (HD QUALIFIED)!", (w // 6, h // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 255, 0), 3)
+                cv2.rectangle(flash, (0, 0), (w, h), (0, 80, 0), 12)
+                cv2.rectangle(flash, (w // 8, h // 3), (7 * w // 8, h // 3 + 95), (0, 140, 0), -1)
+                cv2.putText(flash, f"POSE {count}/5 ACCEPTED! (HIGH QUALITY)", (w // 8 + 25, h // 3 + 38),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.80, (255, 255, 255), 2)
+                cv2.putText(flash, f"Sharpness: {int(snap_metrics.get('sharpness', 0))} | Stored for Attendance", (w // 8 + 25, h // 3 + 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 255, 200), 2)
                 cv2.imshow(win_title, flash)
-                cv2.waitKey(350)
+                cv2.waitKey(650)
+            else:
+                # Image quality is NOT better/sufficient -> Tell user to RETAKE!
+                failure_msg = "Please hold still and ensure good lighting."
+                if not pos_pass:
+                    failure_msg = "Face was near frame edge. Center face and retake."
+                elif "BLURRY" in snap_reason:
+                    failure_msg = f"Blurry image (Sharpness {int(snap_metrics.get('sharpness',0))}/75). Hold still and retake."
+                elif "LOW_LIGHT" in snap_reason:
+                    failure_msg = "Face was too dark. Move into better light and retake."
+                elif "OVEREXPOSED" in snap_reason:
+                    failure_msg = "Too much bright glare on face. Adjust lighting and retake."
+                elif "FACE_EXTREME_ANGLE" in snap_reason:
+                    failure_msg = "Head turned too far. Face closer to center and retake."
+                elif not biometric_verified:
+                    failure_msg = "Biometric neural network could not clearly read face. Retake photo."
+
+                flash = processed_frame.copy()
+                cv2.rectangle(flash, (0, 0), (w, h), (0, 0, 150), 10)
+                cv2.rectangle(flash, (w // 10, h // 3), (9 * w // 10, h // 3 + 105), (0, 0, 180), -1)
+                cv2.putText(flash, "IMAGE QUALITY NOT SUFFICIENT - PLEASE RETAKE", (w // 10 + 18, h // 3 + 38),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2)
+                cv2.putText(flash, failure_msg, (w // 10 + 20, h // 3 + 75),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 255, 255), 1)
+                cv2.imshow(win_title, flash)
+                cv2.waitKey(1100)
 
     cap.release()
     cv2.destroyAllWindows()

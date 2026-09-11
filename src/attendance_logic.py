@@ -89,8 +89,35 @@ def start_attendance(subject_info=None):
     print(f"[INFO] Initiating {NUM_SHOTS}-Shot Multi-Angle Batch Capture (Consensus: {REQUIRED_MATCHES}/{NUM_SHOTS})...")
 
     # PHASE 1: BATCH CAPTURE WITH REAL-TIME MULTI-FACE DETECTION
+    try:
+        import winsound
+    except Exception:
+        winsound = None
+
+    # Initial 3-second preparation buffer: allows all students to settle and face the camera before Shot 1
+    prep_start = time.time()
+    prep_duration = 3.0
+    while time.time() - prep_start < prep_duration:
+        ret, frame = cap.read()
+        if not ret: break
+        prep_frame = frame.copy()
+        time_rem = max(0.0, prep_duration - (time.time() - prep_start))
+        _, p_faces = detector.detect_faces(prep_frame)
+        cv2.rectangle(prep_frame, (10, 10), (760, 160), (20, 20, 20), -1)
+        cv2.rectangle(prep_frame, (10, 10), (760, 160), (0, 255, 255), 2)
+        cv2.putText(prep_frame, f"CLASS ATTENDANCE STARTING: {sub_code}", (25, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
+        cv2.putText(prep_frame, f"ALL STUDENTS PLEASE FACE THE CAMERA! ({len(p_faces)} faces in view)", (25, 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, (200, 200, 200), 1)
+        cv2.putText(prep_frame, f"First Capture in: {time_rem:.1f}s", (25, 128),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
+        cv2.imshow("SmartClass Vision - Section Attendance Scan", prep_frame)
+        cv2.waitKey(1)
+
     for i in range(NUM_SHOTS):
         start_wait = time.time()
+        beep_played = False
+
         while time.time() - start_wait < SHOT_INTERVAL:
             ret, frame = cap.read()
             if not ret: break
@@ -102,9 +129,19 @@ def start_attendance(subject_info=None):
             _, live_faces = detector.detect_faces(display_frame)
             active_count = len(live_faces)
 
+            # Pre-shot alert: audio beep & visual border pulse 0.5s before snap
+            is_imminent = time_left <= 0.6
+            if is_imminent and not beep_played and winsound:
+                try:
+                    winsound.Beep(1200, 120)  # Gentle 1200Hz alert beep
+                except Exception:
+                    pass
+                beep_played = True
+
             # Draw session banner
-            cv2.rectangle(display_frame, (10, 10), (750, 155), (20, 20, 20), -1)
-            cv2.rectangle(display_frame, (10, 10), (750, 155), (0, 200, 255), 2)
+            banner_border = (0, 0, 255) if is_imminent else (0, 200, 255)
+            cv2.rectangle(display_frame, (10, 10), (760, 160), (20, 20, 20), -1)
+            cv2.rectangle(display_frame, (10, 10), (760, 160), banner_border, 2)
 
             cv2.putText(display_frame, f"Subject: {sub_code} ({class_title})", (25, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
@@ -113,8 +150,15 @@ def start_attendance(subject_info=None):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             cv2.putText(display_frame, f"Section Enrolled: {enrolled_count} Students | Live Faces: {active_count}", (25, 95),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1)
-            cv2.putText(display_frame, f"Scan Shot {i + 1}/{NUM_SHOTS} - Next Snap: {time_left:.1f}s", (25, 130),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+
+            snap_text = f"LOOK AT CAMERA! SNAPPING IN {time_left:.1f}s" if is_imminent else f"Scan Shot {i + 1}/{NUM_SHOTS} - Next Snap: {time_left:.1f}s"
+            snap_color = (0, 140, 255) if is_imminent else (0, 255, 0)
+            cv2.putText(display_frame, snap_text, (25, 134),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.72, snap_color, 2)
+
+            if is_imminent:
+                # Flashing border alert for the classroom
+                cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], display_frame.shape[0]), (0, 165, 255), 6)
 
             cv2.imshow("SmartClass Vision - Section Attendance Scan", display_frame)
             cv2.waitKey(1)
@@ -128,6 +172,13 @@ def start_attendance(subject_info=None):
             photo_name = f"ClassAudit_{sub_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_Shot{i + 1}.jpg"
             cv2.imwrite(str(CLASS_PHOTOS_DIR / photo_name), frame)
             print(f"[CAPTURE] Secured High-Res Image: {photo_name}")
+
+            # Shutter sound
+            if winsound:
+                try:
+                    winsound.Beep(2000, 80)
+                except Exception:
+                    pass
 
             # Elegant capture visual confirmation
             feedback_frame = frame.copy()

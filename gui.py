@@ -1081,8 +1081,60 @@ class SmartClassApp(ctk.CTk):
         btn_bar = ctk.CTkFrame(card, fg_color="transparent")
         btn_bar.pack(fill="x", padx=14, pady=(12, 6))
 
+        def open_captured_photos_gallery():
+            gallery_win = ctk.CTkToplevel(profile_win)
+            gallery_win.title(f"All Captured Photos - {record[1]} ({record[0]})")
+            gallery_win.geometry("680x280")
+            gallery_win.resizable(False, False)
+            gallery_win.transient(profile_win)
+            gallery_win.lift()
+            gallery_win.attributes('-topmost', True)
+            gallery_win.focus_force()
+
+            gallery_card = ctk.CTkFrame(gallery_win, corner_radius=14, fg_color="#181824", border_width=1, border_color="#2b2d42")
+            gallery_card.pack(fill="both", expand=True, padx=14, pady=14)
+
+            top_row = ctk.CTkFrame(gallery_card, fg_color="transparent")
+            top_row.pack(fill="x", padx=12, pady=(8, 10))
+            ctk.CTkLabel(top_row, text=f"📸 All {img_count} Enrolled Face Captures", font=ctk.CTkFont(size=16, weight="bold"), text_color="#00ffcc").pack(side="left")
+
+            def open_in_explorer():
+                import os
+                if student_dir.exists():
+                    os.startfile(str(student_dir))
+
+            ctk.CTkButton(top_row, text="📁 Open Folder in Explorer", command=open_in_explorer, height=28, width=170,
+                          fg_color="#334155", hover_color="#475569", font=ctk.CTkFont(size=12)).pack(side="right")
+
+            photos_container = ctk.CTkFrame(gallery_card, fg_color="transparent")
+            photos_container.pack(fill="both", expand=True, padx=10, pady=5)
+
+            all_photos = sorted(list(student_dir.glob("*.jpg"))) if student_dir.exists() else []
+            gallery_imgs = []  # retain reference to prevent GC
+
+            if all_photos:
+                for idx, p in enumerate(all_photos[:5]):
+                    thumb_box = ctk.CTkFrame(photos_container, corner_radius=10, fg_color="#0f1017", border_width=1, border_color="#27293d")
+                    thumb_box.pack(side="left", fill="both", expand=True, padx=5, pady=2)
+                    try:
+                        p_img = Image.open(p)
+                        c_img = ctk.CTkImage(light_image=p_img, dark_image=p_img, size=(105, 120))
+                        gallery_imgs.append(c_img)
+                        lbl = ctk.CTkLabel(thumb_box, image=c_img, text="")
+                        lbl.pack(pady=(8, 2))
+                    except Exception:
+                        pass
+                    ctk.CTkLabel(thumb_box, text=f"Shot {idx+1}", font=ctk.CTkFont(size=11, weight="bold"), text_color="#94a3b8").pack(pady=(0, 6))
+            else:
+                ctk.CTkLabel(photos_container, text="No images found on disk.", text_color="gray").pack(pady=40)
+
+            gallery_win.gallery_imgs = gallery_imgs
+
         def close_profile():
             profile_win.destroy()
+
+        ctk.CTkButton(btn_bar, text=f"🖼️ View All ({img_count}) Photos", command=open_captured_photos_gallery, height=36, width=170,
+                      fg_color="#0d9488", hover_color="#0f766e", font=ctk.CTkFont(weight="bold")).pack(side="left")
 
         ctk.CTkButton(btn_bar, text="Done / Close", command=close_profile, height=36, width=130,
                       fg_color="#1f538d", hover_color="#14375e", font=ctk.CTkFont(weight="bold")).pack(side="right")

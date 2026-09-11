@@ -1,4 +1,8 @@
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+import logging
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
 import cv2
 import pickle
 import numpy as np
@@ -10,32 +14,52 @@ from utils.config import (
     MIN_CONTRAST, MAX_YAW_RATIO
 )
 
-os.environ["DEEPFACE_HOME"] = str(DEEPFACE_DIR)
-from deepface import DeepFace
-
+ARCFACE_ONNX_PATH = Path.home() / ".insightface" / "models" / "buffalo_m" / "w600k_r50.onnx"
 EMBEDDINGS_FILE = BASE_DIR / "data" / "embeddings.pkl"
 
 
 class FaceRecognizer:
     def __init__(self):
-        self.model_name = "ArcFace"
+        self.model_name = "ArcFace-w600k_r50"
         self.known_embeddings = {}
         self.centroids = {}
-        # Converted to Cosine Similarity (1.0 = identical, 0.0 = orthogonal)
-        # Similarity Threshold 0.65 corresponds to Cosine Distance <= 0.35
         self.min_similarity = ARCFACE_SIMILARITY_THRESHOLD
         self.ambiguity_margin = AMBIGUITY_MARGIN
+        self.onnx_rec = None
+
+        # Load Native ONNX ArcFace ResNet-50
+        if ARCFACE_ONNX_PATH.exists():
+            try:
+                from insightface.model_zoo import get_model
+                self.onnx_rec = get_model(str(ARCFACE_ONNX_PATH), providers=['CPUExecutionProvider'])
+                self.onnx_rec.prepare(ctx_id=0)
+            except Exception as e:
+                print(f"[INFO] ArcFace ONNX fallback: {e}")
+                self.onnx_rec = None
 
         if EMBEDDINGS_FILE.exists():
             with open(EMBEDDINGS_FILE, "rb") as f:
                 self.known_embeddings = pickle.load(f)
             self._compute_centroids()
 
-        # Warm up the ArcFace neural network weights in memory to eliminate cold-start delay
+    def _extract_embedding(self, face_crop):
+        """Extract 512-D L2-normalized embedding using ONNX ArcFace R50 with DeepFace fallback."""
+        if self.onnx_rec is not None:
+            aligned = cv2.resize(face_crop, (112, 112)) if face_crop.shape[:2] != (112, 112) else face_crop
+            feat = self.onnx_rec.get_feat(aligned)
+            if feat is not None and len(feat) > 0:
+                vec = feat[0]
+                norm = np.linalg.norm(vec)
+                return (vec / (norm + 1e-10)).tolist() if norm > 0 else None
         try:
-            DeepFace.build_model(self.model_name)
-        except Exception as e:
+            os.environ["DEEPFACE_HOME"] = str(DEEPFACE_DIR)
+            from deepface import DeepFace
+            res = DeepFace.represent(face_crop, model_name="ArcFace", enforce_detection=False)
+            if res and len(res) > 0:
+                return res[0]["embedding"]
+        except Exception:
             pass
+        return None
 
     def _compute_centroids(self):
         self.centroids = {}
@@ -86,10 +110,10 @@ class FaceRecognizer:
                     q_pass, q_reason, _ = evaluate_face_quality(
                         raw_crop, landmarks=landmarks,
                         min_size=MIN_FACE_SIZE,
-                        blur_thresh=60.0, # Lenient blur threshold for webcam enrollment
+                        blur_thresh=50.0, # Lenient blur threshold for webcam enrollment
                         min_b=MIN_BRIGHTNESS, max_b=MAX_BRIGHTNESS,
                         min_contrast=MIN_CONTRAST,
-                        max_yaw_ratio=MAX_YAW_RATIO
+                        max_yaw_ratio=0.35 # Allow gentle multi-angle poses captured during registration
                     )
 
                     if not q_pass:
@@ -97,9 +121,9 @@ class FaceRecognizer:
                         continue
 
                     face_crop = f["image"]
-                    res = DeepFace.represent(face_crop, model_name=self.model_name, enforce_detection=False)
-                    if len(res) > 0:
-                        embeddings_dict[roll_number].append(res[0]["embedding"])
+                    emb = self._extract_embedding(face_crop)
+                    if emb is not None:
+                        embeddings_dict[roll_number].append(emb)
                         accepted += 1
                     else:
                         rejected += 1
@@ -113,9 +137,9 @@ class FaceRecognizer:
                 if first_img is not None:
                     _, f_faces = detector.detect_faces(first_img)
                     if f_faces:
-                        res = DeepFace.represent(f_faces[0]["image"], model_name=self.model_name, enforce_detection=False)
-                        if res:
-                            embeddings_dict[roll_number].append(res[0]["embedding"])
+                        emb = self._extract_embedding(f_faces[0]["image"])
+                        if emb is not None:
+                            embeddings_dict[roll_number].append(emb)
                             accepted = 1
                             rejected = len(img_files) - 1
 
@@ -199,11 +223,11 @@ class FaceRecognizer:
             if face_crop.shape[0] < 20 or face_crop.shape[1] < 20:
                 return "Unknown", 0.0, {"reason": "CROP_TOO_SMALL"}
 
-            res = DeepFace.represent(face_crop, model_name=self.model_name, enforce_detection=False)
-            if len(res) == 0:
+            emb = self._extract_embedding(face_crop)
+            if emb is None:
                 return "Unknown", 0.0, {"reason": "NO_REPRESENTATION"}
 
-            live_embedding = np.array(res[0]["embedding"])
+            live_embedding = np.array(emb)
             return self._match_single_embedding(live_embedding, candidate_rolls=candidate_rolls)
         except Exception as e:
             return "Unknown", 0.0, {"reason": str(e)}
@@ -226,10 +250,24 @@ class FaceRecognizer:
             if not valid_crops:
                 return [("Unknown", 0.0, {})] * len(face_crops)
 
-            # Single batch forward pass through ArcFace
-            batch_results = DeepFace.represent(valid_crops, model_name=self.model_name, enforce_detection=False)
-            
             output = [("Unknown", 0.0, {})] * len(face_crops)
+
+            # Fast Native ONNX ArcFace Inference
+            if self.onnx_rec is not None:
+                for res_idx, orig_idx in enumerate(valid_indices):
+                    crop = valid_crops[res_idx]
+                    aligned = cv2.resize(crop, (112, 112)) if crop.shape[:2] != (112, 112) else crop
+                    feat = self.onnx_rec.get_feat(aligned)
+                    if feat is not None and len(feat) > 0:
+                        vec = feat[0]
+                        norm = np.linalg.norm(vec)
+                        emb = vec / (norm + 1e-10) if norm > 0 else vec
+                        output[orig_idx] = self._match_single_embedding(emb, candidate_rolls=candidate_rolls)
+                return output
+
+            # DeepFace Fallback
+            from deepface import DeepFace
+            batch_results = DeepFace.represent(valid_crops, model_name="ArcFace", enforce_detection=False)
             for res_idx, orig_idx in enumerate(valid_indices):
                 if res_idx < len(batch_results):
                     emb = np.array(batch_results[res_idx]["embedding"])

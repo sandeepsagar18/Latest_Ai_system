@@ -16,6 +16,7 @@ runs/
 *.db
 .env
 
+tools/
 .DS_Store
 
 __pycache__/
