@@ -18,7 +18,7 @@ An automated, ultra-fast **AI-Powered Face Recognition Attendance & Classroom Ma
 - **5-Point Landmark Normalization**: Automatically extracts 5 key facial coordinates (both eyes, nose tip, both mouth corners) and applies a partial affine transformation with **Bicubic interpolation (INTER_CUBIC)** to warp faces onto standard 112x112 canonical crops before recognition.
 
 ### 2. InsightFace ArcFace ResNet-50 Biometric Engine (w600k_r50.onnx)
-- **512-Dimensional Deep Metric Hyperspace**: live faces are encoded with ArcFace (Additive Angular Margin Loss) deep learning feature vectors trained on the massive WebFace600K dataset (12M images, 600K identities).
+- **512-Dimensional Deep Metric Hyperspace**: Live faces are encoded with ArcFace (Additive Angular Margin Loss) deep learning feature vectors trained on the massive WebFace600K dataset (12M images, 600K identities).
 - **Sub-20ms Native ONNX Inference**: Operates directly through Microsoft onnxruntime with C++ SIMD vectorization (~18ms per face), completely bypassing TensorFlow/Keras overhead.
 - **Centroid Profile Matching**: Computes Cosine Similarity against quality-filtered student centroid models.
 - **Ambiguity Margin Guard**: Requires top match to hold a >= 0.06 margin over the second-place candidate to avoid false identity swaps.
@@ -55,7 +55,7 @@ An automated, ultra-fast **AI-Powered Face Recognition Attendance & Classroom Ma
 
 ## 📂 Project Architecture
 
-`	ext
+```text
 SmartClassVision/
 ├── data/
 │   ├── attendance_records/     # Auto-generated and cryptographically signed CSV sheets
@@ -79,14 +79,14 @@ SmartClassVision/
 ├── requirements.txt            # Python dependencies
 ├── run.bat                     # Windows quick launch script
 └── README.md                   # Project documentation
-`
+```
 
 ---
 
 ## ⚙️ Quick Start Guide
 
 ### 1. Clone & Setup Environment
-`ash
+```bash
 git clone https://github.com/sandeepsagar18/Latest_Ai_system.git
 cd Latest_Ai_system
 
@@ -98,14 +98,13 @@ venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
-`
+```
 
 ### 2. Run the Application
-`ash
+```bash
 python gui.py
-`
-*(Or double-click 
-un.bat on Windows)*
+```
+*(Or double-click `run.bat` on Windows)*
 
 ---
 
