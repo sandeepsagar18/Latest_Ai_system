@@ -1,0 +1,72 @@
+{
+  "experiment_id": "baseline_20261119_161546_678c2d",
+  "experiment_name": "Benchmark_baseline_20261119_161546_678c2d",
+  "experiment_type": "baseline",
+  "timestamp": "20261119_161546",
+  "git_commit": "a42a08a984a9d5d557bedfbd32eaf7e3f93453bb",
+  "dataset_version": "v1.0",
+  "random_seed": 42,
+  "notes": "Standard ByteTrack v2 with MiniFASNetV2 Baseline",
+  "environment": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python_version": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+    "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+    "machine": "AMD64",
+    "os": "Windows"
+  },
+  "models": {
+    "detector": {
+      "name": "SCRFD-2.5GF",
+      "path": "C:\\Users\\hp\\Desktop\\SmartClassVision\\SmartClassVision\\models\\models\\buffalo_m\\det_2.5g.onnx",
+      "sha256": "041f73f47371333d1d17a6fee6c8ab4e6aecabefe398ff32cca4e2d5eaee0af9"
+    },
+    "recognizer": {
+      "name": "ArcFace ResNet-50",
+      "path": "C:\\Users\\hp\\Desktop\\SmartClassVision\\SmartClassVision\\models\\models\\buffalo_m\\w600k_r50.onnx",
+      "sha256": "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43"
+    },
+    "antispoof": {
+      "name": "MiniFASNetV2",
+      "path": "C:\\Users\\hp\\Desktop\\SmartClassVision\\SmartClassVision\\models\\minifasnet_v2.onnx",
+      "sha256": "d7b3cd9ba8a7ceb13baa8c4720902e27ca3112eff52f926c08804af6b6eecc7b"
+    }
+  },
+  "parameters": {
+    "detection": {
+      "det_size": [
+        640,
+        640
+      ],
+      "min_face_size": 20,
+      "blur_threshold": 25.0,
+      "min_brightness": 35.0,
+      "max_brightness": 230.0,
+      "min_contrast": 18.0,
+      "max_yaw_ratio": 0.5
+    },
+    "tracking": {
+      "track_thresh": 0.5,
+      "low_thresh": 0.1,
+      "match_thresh": 0.7,
+      "track_buffer": 30,
+      "use_motion_gating": false,
+      "gating_threshold": 14.45
+    },
+    "recognition": {
+      "cosine_threshold": 0.52,
+      "ambiguity_margin": 0.06,
+      "embedding_dim": 512,
+      "vectorized_batch": true
+    },
+    "antispoof": {
+      "liveness_threshold": 0.55,
+      "texture_threshold": 35.0,
+      "minifasnet_real_thresh": 0.75
+    },
+    "attendance": {
+      "num_shots": 10,
+      "quorum_threshold": 3,
+      "shot_interval_sec": 1.2
+    }
+  }
+}
