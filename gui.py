@@ -713,7 +713,10 @@ class SmartClassApp(ctk.CTk):
                 latest_sheet = max(unique_sheets, key=os.path.getctime)
                 try:
                     df = pd.read_csv(latest_sheet)
-                    present_count = len(df)
+                    if 'Status' in df.columns:
+                        present_count = len(df[df['Status'].astype(str).str.strip().str.upper() == 'PRESENT'])
+                    else:
+                        present_count = len(df)
                 except:
                     pass
 
@@ -776,7 +779,8 @@ class SmartClassApp(ctk.CTk):
                         for _, row in df.iterrows():
                             roll_str = str(row['Roll Number'])
                             if roll_str in all_students:
-                                all_students[roll_str]["status"] = "PRESENT"
+                                row_status = str(row.get('Status', 'PRESENT')).strip().upper()
+                                all_students[roll_str]["status"] = row_status
                                 all_students[roll_str]["time"] = row['Time Marked']
                     except:
                         pass
@@ -806,7 +810,8 @@ class SmartClassApp(ctk.CTk):
                         for index, row in df.iterrows():
                             roll = str(row['Roll Number'])
                             if roll in all_students:
-                                all_students[roll]["status"] = "PRESENT"
+                                row_status = str(row.get('Status', 'PRESENT')).strip().upper()
+                                all_students[roll]["status"] = row_status
                                 all_students[roll]["time"] = row['Time Marked']
                     except:
                         pass
@@ -2442,7 +2447,7 @@ class SmartClassApp(ctk.CTk):
                 f"• Total Active Subjects: {stats['subjects']}\n"
                 f"• Total Attendance Records: {stats['attendance_records']}\n\n"
                 f"• AI Facial Embeddings: {stats['embeddings_count']} Loaded\n"
-                f"• YuNet Human Face Model: {'✅ Present' if stats.get('yunet_weights') else '❌ Missing'}\n"
+                f"• SCRFD Face Detector Model: {'✅ Present' if stats.get('scrfd_weights') else '❌ Missing'}\n"
                 f"• ArcFace Deep Learning Model: {'✅ Present' if stats.get('arcface_weights') else '❌ Missing'}"
             )
             lbl_diag_text.configure(text=msg)
@@ -2621,13 +2626,23 @@ class SmartClassApp(ctk.CTk):
             hmac_sig = result.get("hmac_signature")
 
             verified_list = result.get("verified_students", []) if isinstance(result, dict) else []
+            rejected_list = result.get("rejected_students", []) if isinstance(result, dict) else []
+
             names_summary = ""
             if verified_list:
-                names_summary = "\n\n🎓 Verified Students:\n" + "\n".join(
-                    [f"  • {s['name']} ({s['roll']}) - {s['time']}" for s in verified_list[:12]]
+                names_summary = "\n\n🎓 Verified Present:\n" + "\n".join(
+                    [f"  • {s['name']} ({s['roll']}) - {s['time']}" for s in verified_list[:10]]
                 )
-                if len(verified_list) > 12:
-                    names_summary += f"\n  ...and {len(verified_list) - 12} more students."
+                if len(verified_list) > 10:
+                    names_summary += f"\n  ...and {len(verified_list) - 10} more students."
+
+            wrong_section_summary = ""
+            if rejected_list:
+                wrong_section_summary = "\n\n🚫 Wrong Section / Class Attendees Discarded:\n" + "\n".join(
+                    [f"  • {s['name']} ({s['roll']}) — Enrolled: {s.get('enrolled', 'Other Section')}" for s in rejected_list[:10]]
+                )
+                if len(rejected_list) > 10:
+                    wrong_section_summary += f"\n  ...and {len(rejected_list) - 10} more students."
 
             msg = (
                 f"Batch Attendance Completed!\n\n"
@@ -2636,7 +2651,8 @@ class SmartClassApp(ctk.CTk):
                 f"Section Enrolled: {enrolled}\n\n"
                 f"✅ Verified Present: {verified} students\n"
                 f"❌ Wrong Section Discarded: {rejected} students"
-                f"{names_summary}\n"
+                f"{names_summary}"
+                f"{wrong_section_summary}\n"
             )
             if spoofs > 0:
                 msg += f"\n🚨 Spoof Attacks Blocked: {spoofs} (Audit snapshots saved)\n"

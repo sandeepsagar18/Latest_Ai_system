@@ -1,3 +1,4 @@
+import sys
 import cv2
 import time
 import re
@@ -9,6 +10,7 @@ from datetime import datetime
 from src.detector import FaceDetector
 from src.recognizer import FaceRecognizer
 from src.anti_spoof import evaluate_liveness, evaluate_face_quality
+from src.byte_track import ByteTracker
 from src.database import get_student_info, save_attendance_entry, get_students_by_class, generate_file_checksum, log_security_event
 from utils.config import (
     ATTENDANCE_DIR, CLASS_PHOTOS_DIR, UNKNOWN_FACES_DIR, CAMERA_ID, BASE_DIR,
@@ -73,7 +75,13 @@ def start_attendance(subject_info=None):
     ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
     CLASS_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
-    cap = cv2.VideoCapture(CAMERA_ID)
+    # Fix V13: Standardize camera capture with cv2.CAP_DSHOW on Windows
+    if sys.platform == "win32":
+        cap = cv2.VideoCapture(CAMERA_ID, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(CAMERA_ID)
+    else:
+        cap = cv2.VideoCapture(CAMERA_ID)
 
     # Force High Definition
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
@@ -83,7 +91,7 @@ def start_attendance(subject_info=None):
     SHOT_INTERVAL = SHOT_COUNTDOWN_SECONDS
     captured_frames = []
 
-    # Extract target section student roll numbers for context-aware priority matching
+    # Extract target section student roll numbers for context-aware priority matching (Fix V04)
     enrolled_roll_numbers = [str(s[0]) for s in enrolled_students] if enrolled_students else []
 
     print(f"[INFO] Initiating {NUM_SHOTS}-Shot Multi-Angle Batch Capture (Consensus: {REQUIRED_MATCHES}/{NUM_SHOTS})...")
@@ -102,7 +110,7 @@ def start_attendance(subject_info=None):
         if not ret: break
         prep_frame = frame.copy()
         time_rem = max(0.0, prep_duration - (time.time() - prep_start))
-        _, p_faces = detector.detect_faces(prep_frame)
+        prep_frame, p_faces = detector.detect_faces(prep_frame)
         cv2.rectangle(prep_frame, (10, 10), (760, 160), (20, 20, 20), -1)
         cv2.rectangle(prep_frame, (10, 10), (760, 160), (0, 255, 255), 2)
         cv2.putText(prep_frame, f"CLASS ATTENDANCE STARTING: {sub_code}", (25, 42),
@@ -113,6 +121,9 @@ def start_attendance(subject_info=None):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
         cv2.imshow("SmartClass Vision - Section Attendance Scan", prep_frame)
         cv2.waitKey(1)
+
+    # Initialize ByteTracker for robust multi-face tracking across preview and capture frames
+    byte_tracker = ByteTracker(track_thresh=0.50, match_thresh=0.70, track_buffer=30)
 
     for i in range(NUM_SHOTS):
         start_wait = time.time()
@@ -125,9 +136,18 @@ def start_attendance(subject_info=None):
             display_frame = frame.copy()
             time_left = max(0.0, SHOT_INTERVAL - (time.time() - start_wait))
 
-            # Detect multiple faces in live preview so teacher sees all students being captured
-            _, live_faces = detector.detect_faces(display_frame)
-            active_count = len(live_faces)
+            # Detect multiple faces in live preview and update ByteTrack tracks
+            display_frame, live_faces = detector.detect_faces(display_frame)
+            active_tracks = byte_tracker.update(live_faces)
+            active_count = len(active_tracks)
+
+            # Draw ByteTrack persistent track IDs on preview
+            for trk in active_tracks:
+                tb = trk.tlbr.astype(int)
+                tx1, ty1, tx2, ty2 = tb[0], tb[1], tb[2], tb[3]
+                cv2.rectangle(display_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 2)
+                cv2.putText(display_frame, f"ID:{trk.track_id}", (tx1, max(20, ty1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
             # Pre-shot alert: audio beep & visual border pulse 0.5s before snap
             is_imminent = time_left <= 0.6
@@ -192,11 +212,14 @@ def start_attendance(subject_info=None):
 
     cap.release()
 
-    # PHASE 2: AI PROCESSING (SECTION-AWARE MULTI-STUDENT RECOGNITION)
+    # PHASE 2: AI PROCESSING (SECTION-AWARE MULTI-STUDENT RECOGNITION WITH BYTETRACK)
     print(f"\n[INFO] Cross-referencing captures with Section Roster ({len(enrolled_roll_numbers)} enrolled candidates)...")
-    student_detections = {}
+    student_shots = {}  # Fix V05: roll -> set of unique shot indices
     student_similarities = {}
     spoof_incidents = 0
+
+    # ByteTracker for multi-frame identity association across the 10 captured shots
+    capture_tracker = ByteTracker(track_thresh=0.50, match_thresh=0.70, track_buffer=10)
 
     for f_idx, frame in enumerate(captured_frames):
         # Update live visual progress window
@@ -214,7 +237,8 @@ def start_attendance(subject_info=None):
         cv2.waitKey(1)
 
         processed_frame, detected_faces = detector.detect_faces(frame)
-        print(f"\n[SHOT {f_idx + 1}] Detected {len(detected_faces)} raw face bounding boxes in frame")
+        active_shot_tracks = capture_tracker.update(detected_faces)
+        print(f"\n[SHOT {f_idx + 1}] Detected {len(detected_faces)} raw face bounding boxes ({len(active_shot_tracks)} active ByteTrack trajectories)")
 
         valid_live_crops = []
         for face_idx, face_data in enumerate(detected_faces):
@@ -244,8 +268,14 @@ def start_attendance(subject_info=None):
                     print("-" * 30)
                 continue
 
-            # Biometric Liveness & Anti-Spoofing Assessment
-            is_live, l_score, l_reason = evaluate_liveness(raw_crop)
+            # Biometric Liveness & Anti-Spoofing Assessment (MiniFASNetV2 + Multi-Spectral Glare)
+            # Convert landmarks to crop relative coordinates for spectacle orbital exclusion (Fix V10)
+            crop_landmarks = None
+            if landmarks is not None:
+                x1, y1 = coords[0], coords[1]
+                crop_landmarks = landmarks - np.array([x1, y1], dtype=np.float32)
+
+            is_live, l_score, l_reason = evaluate_liveness(raw_crop, landmarks=crop_landmarks, full_frame=frame, coords=coords)
             if not is_live:
                 spoof_incidents += 1
                 spoof_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -268,7 +298,22 @@ def start_attendance(subject_info=None):
         # STEP 5 & 6: Vectorized Canonical ArcFace Inference with Global Cosine Matching & UNKNOWN Gating
         if valid_live_crops:
             aligned_batch = [item["aligned"] for item in valid_live_crops]
-            batch_matches = recognizer.recognize_batch(aligned_batch)
+            # Primary Tier: Match against target section enrolled candidates
+            batch_matches = recognizer.recognize_batch(aligned_batch, candidate_rolls=enrolled_roll_numbers)
+            
+            # Secondary Tier: For any crops not matched in target roster, check global student gallery
+            # to detect students sitting in the wrong class / section
+            unmatched_indices = [i for i, m in enumerate(batch_matches) if m[0] == "Unknown"]
+            if unmatched_indices and enrolled_roll_numbers:
+                unmatched_crops = [aligned_batch[i] for i in unmatched_indices]
+                global_matches = recognizer.recognize_batch(unmatched_crops, candidate_rolls=None)
+                for sub_idx, orig_batch_idx in enumerate(unmatched_indices):
+                    g_match = global_matches[sub_idx]
+                    g_roll, g_conf, g_diag = g_match[0], g_match[1], g_match[2] if len(g_match) > 2 else {}
+                    if g_roll != "Unknown":
+                        # Identified as a registered student belonging to another section/class
+                        batch_matches[orig_batch_idx] = (g_roll, g_conf, g_diag)
+
             for item_idx, match_res in enumerate(batch_matches):
                 roll_number = match_res[0]
                 confidence = match_res[1]
@@ -279,7 +324,7 @@ def start_attendance(subject_info=None):
                 det_score = item_info["det_score"]
                 q_met = item_info["metrics"]
 
-                # Step 11: Structured Debug Output for every detected face
+                # Structured Debug Output for every detected face
                 if DEBUG_MODE:
                     print(f"\n--- FACE #{item_idx + 1} (SHOT {f_idx + 1}) ---")
                     print(f"Detection confidence: {det_score:.2f}")
@@ -300,14 +345,16 @@ def start_attendance(subject_info=None):
                     print("-" * 30)
 
                 if roll_number != "Unknown":
-                    student_detections[roll_number] = student_detections.get(roll_number, 0) + 1
-                    if roll_number not in student_similarities:
+                    # Fix V05: Track unique shot indices per student to prevent intra-shot duplicate vote accumulation
+                    if roll_number not in student_shots:
+                        student_shots[roll_number] = set()
                         student_similarities[roll_number] = []
+                    student_shots[roll_number].add(f_idx)
                     student_similarities[roll_number].append(diag.get("top1_sim", confidence / 100.0))
 
     cv2.destroyAllWindows()
 
-    # PHASE 3: CONSENSUS, SECTION FILTER & EXPORT
+    # PHASE 3: CONSENSUS, SECTION FILTER & PERSISTENCE
     attendance_list = []
     rejected_wrong_section = []
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -317,7 +364,7 @@ def start_attendance(subject_info=None):
     print("   SECTION VALIDATION & VERIFICATION RESULTS")
     print("=" * 55)
 
-    for roll, count in student_detections.items():
+    for roll, shot_set in student_shots.items():
         info = get_student_info(roll)
         if not info:
             continue
@@ -325,6 +372,7 @@ def start_attendance(subject_info=None):
         s_roll, s_name, s_gender, s_degree, s_year, s_branch, s_section, _ = info
         sim_scores = student_similarities.get(roll, [])
         avg_similarity = float(np.mean(sim_scores)) if sim_scores else 0.0
+        unique_shots = len(shot_set)
 
         # Strict Section & Branch validation
         match_degree = (target_degree is None or s_degree.strip().upper() == target_degree.strip().upper())
@@ -334,12 +382,12 @@ def start_attendance(subject_info=None):
 
         is_correct_section = match_degree and match_year and match_branch and match_section
 
-        # Step 5 & 6: Strengthened Temporal Consensus (at least 5/7 votes AND mean similarity >= 0.65)
-        passed_consensus = (count >= REQUIRED_MATCHES) and (avg_similarity >= ARCFACE_SIMILARITY_THRESHOLD)
+        # Fix V05: Quorum evaluated strictly on unique shot count len(student_shots[roll]) >= REQUIRED_MATCHES
+        passed_consensus = (unique_shots >= REQUIRED_MATCHES) and (avg_similarity >= ARCFACE_SIMILARITY_THRESHOLD)
 
         if passed_consensus:
             if is_correct_section:
-                print(f"[VERIFIED - SECTION MATCH] {s_name} ({s_roll}) -> {s_branch} Sec {s_section} -> PRESENT (Votes: {count}/{NUM_SHOTS}, Avg Sim: {avg_similarity:.3f})")
+                print(f"[VERIFIED - SECTION MATCH] {s_name} ({s_roll}) -> {s_branch} Sec {s_section} -> PRESENT (Unique Shots: {unique_shots}/{NUM_SHOTS}, Avg Sim: {avg_similarity:.3f})")
                 attendance_list.append({
                     "Subject Code": sub_code,
                     "Subject Name": sub_name,
@@ -366,24 +414,53 @@ def start_attendance(subject_info=None):
                 if not match_branch: mismatch_reasons.append(f"Branch '{s_branch}' != target '{target_branch}'")
                 if not match_section: mismatch_reasons.append(f"Section '{s_section}' != target '{target_section}'")
                 reason_str = ", ".join(mismatch_reasons)
-                print(f"[REJECTED - WRONG CLASS/SECTION] Student {s_name} ({s_roll}) [{s_degree} {s_year} {s_branch} Sec {s_section}] does not match target class [{target_degree} {target_year} {target_branch} Sec {target_section}]! ({reason_str}, Votes: {count}/{NUM_SHOTS}, Avg Sim: {avg_similarity:.3f}). Attendance denied.")
+                print(f"[REJECTED - WRONG CLASS/SECTION] Student {s_name} ({s_roll}) [{s_degree} {s_year} {s_branch} Sec {s_section}] does not match target class [{target_degree} {target_year} {target_branch} Sec {target_section}]! ({reason_str}, Unique Shots: {unique_shots}/{NUM_SHOTS}, Avg Sim: {avg_similarity:.3f}). Attendance denied.")
                 rejected_wrong_section.append({
                     "roll": s_roll, "name": s_name, "enrolled": f"{s_degree} {s_year} {s_branch} Sec {s_section}"
                 })
         else:
             # Only report insufficient consensus if the student is actually enrolled in this target class/section
             if is_correct_section:
-                print(f"[REJECTED - INSUFFICIENT CONSENSUS] {s_name} ({s_roll}): Votes={count}/{NUM_SHOTS} (Required: {REQUIRED_MATCHES}), Avg Sim={avg_similarity:.3f} (Required: {ARCFACE_SIMILARITY_THRESHOLD}) -> Attendance denied.")
+                print(f"[REJECTED - INSUFFICIENT CONSENSUS] {s_name} ({s_roll}): Unique Shots={unique_shots}/{NUM_SHOTS} (Required: {REQUIRED_MATCHES}), Avg Sim={avg_similarity:.3f} (Required: {ARCFACE_SIMILARITY_THRESHOLD}) -> Attendance denied.")
 
+    # Fix V09: Insert explicit "Absent" database records for enrolled section students who fail quorum or are absent
+    present_roll_set = set(str(a["Roll Number"]).strip() for a in attendance_list if a["Status"] == "Present")
+    absent_students_list = []
+    if enrolled_students:
+        for student in enrolled_students:
+            s_roll, s_name, s_gender, s_degree, s_year, s_branch, s_section = student[:7]
+            if str(s_roll).strip() not in present_roll_set:
+                save_attendance_entry(
+                    sub_id, sub_code, sub_name, teacher_name,
+                    str(s_roll).strip(), s_name, s_branch, s_section,
+                    today_date, timestamp, "Absent"
+                )
+                absent_students_list.append({
+                    "Subject Code": sub_code,
+                    "Subject Name": sub_name,
+                    "Teacher Name": teacher_name,
+                    "Degree": s_degree,
+                    "Year": s_year,
+                    "Branch": s_branch,
+                    "Section": s_section,
+                    "Roll Number": str(s_roll).strip(),
+                    "Name": s_name,
+                    "Time Marked": timestamp,
+                    "Status": "Absent"
+                })
+                print(f"[ABSENT - ENROLLED ROSTER] {s_name} ({s_roll}) -> Absent record persisted to database.")
+
+    # Full session records contain both Present verified attendees and Absent students
+    full_session_records = attendance_list + absent_students_list
 
     filename = None
     hmac_sig = None
-    if attendance_list:
+    if full_session_records:
         clean_sec = clean_filename(target_section or "ALL")
         clean_br = clean_filename(target_branch or "ALL")
         filename = f"Attendance_{sub_code}_{clean_br}_{clean_sec}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         filepath = ATTENDANCE_DIR / filename
-        df = pd.DataFrame(attendance_list)
+        df = pd.DataFrame(full_session_records)
         df.to_csv(filepath, index=False)
         print(f"\n[SUCCESS] Saved section attendance to: {filename}")
 
@@ -391,15 +468,17 @@ def start_attendance(subject_info=None):
         f_hash, hmac_sig = generate_file_checksum(filepath, created_by=f"{teacher_name} ({teacher_emp_id})")
         print(f"[SECURITY] Cryptographic HMAC-SHA256 Registered: {hmac_sig[:16]}...")
     else:
-        print("\n[INFO] No students from the target section passed verification threshold.")
+        print("\n[INFO] No students from the target section recorded.")
 
     return {
-        "verified": len(attendance_list),
+        "verified": len([a for a in attendance_list if a["Status"] == "Present"]),
+        "absent": len(absent_students_list),
         "rejected_section": len(rejected_wrong_section),
         "spoofs_rejected": spoof_incidents,
         "enrolled_total": enrolled_count,
         "filename": filename,
         "hmac_signature": hmac_sig,
-        "verified_students": [{"roll": a["Roll Number"], "name": a["Name"], "time": a["Time Marked"]} for a in attendance_list],
+        "verified_students": [{"roll": a["Roll Number"], "name": a["Name"], "time": a["Time Marked"]} for a in attendance_list if a["Status"] == "Present"],
+        "absent_students": [{"roll": a["Roll Number"], "name": a["Name"], "time": a["Time Marked"]} for a in absent_students_list],
         "rejected_students": rejected_wrong_section
     }

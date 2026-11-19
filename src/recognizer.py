@@ -14,7 +14,10 @@ from utils.config import (
     MIN_CONTRAST, MAX_YAW_RATIO
 )
 
-ARCFACE_ONNX_PATH = Path.home() / ".insightface" / "models" / "buffalo_m" / "w600k_r50.onnx"
+# Search both project models directory and user home cache
+REPO_ONNX_PATH = BASE_DIR / "models" / "buffalo_m" / "w600k_r50.onnx"
+HOME_ONNX_PATH = Path.home() / ".insightface" / "models" / "buffalo_m" / "w600k_r50.onnx"
+ARCFACE_ONNX_PATH = REPO_ONNX_PATH if REPO_ONNX_PATH.exists() else HOME_ONNX_PATH
 EMBEDDINGS_FILE = BASE_DIR / "data" / "embeddings.pkl"
 
 
@@ -26,6 +29,7 @@ class FaceRecognizer:
         self.min_similarity = ARCFACE_SIMILARITY_THRESHOLD
         self.ambiguity_margin = AMBIGUITY_MARGIN
         self.onnx_rec = None
+        self._student_info_cache = {}
 
         # Load Native ONNX ArcFace ResNet-50
         if ARCFACE_ONNX_PATH.exists():
@@ -42,10 +46,17 @@ class FaceRecognizer:
                 self.known_embeddings = pickle.load(f)
             self._compute_centroids()
 
+    def _get_cached_student_info(self, roll):
+        """In-memory cache for student metadata to prevent SQLite I/O bottlenecks in matching loop."""
+        if roll not in self._student_info_cache:
+            from src.database import get_student_info
+            self._student_info_cache[roll] = get_student_info(roll)
+        return self._student_info_cache[roll]
+
     def _extract_embedding(self, face_crop):
         """Extract 512-D L2-normalized embedding using ONNX ArcFace R50 with DeepFace fallback."""
         if self.onnx_rec is not None:
-            aligned = cv2.resize(face_crop, (112, 112)) if face_crop.shape[:2] != (112, 112) else face_crop
+            aligned = cv2.resize(face_crop, (112, 112), interpolation=cv2.INTER_CUBIC) if face_crop.shape[:2] != (112, 112) else face_crop
             feat = self.onnx_rec.get_feat(aligned)
             if feat is not None and len(feat) > 0:
                 vec = feat[0]
@@ -73,7 +84,6 @@ class FaceRecognizer:
     def train_system(self):
         from src.detector import FaceDetector
         from src.anti_spoof import evaluate_face_quality
-        from src.database import get_student_info
 
         print(f"\n[INFO] Training High-Definition {self.model_name} Engine with Quality-Filtered Centroids...")
         detector = FaceDetector()
@@ -143,7 +153,7 @@ class FaceRecognizer:
                             accepted = 1
                             rejected = len(img_files) - 1
 
-            info = get_student_info(roll_number)
+            info = self._get_cached_student_info(roll_number)
             s_name = info[1] if info else roll_number
             enrollment_stats[roll_number] = {"name": s_name, "total": len(img_files), "accepted": accepted, "rejected": rejected}
             print(f"  [{roll_number}] {s_name}: {len(img_files)} images -> {accepted} accepted, {rejected} rejected")
@@ -158,17 +168,23 @@ class FaceRecognizer:
 
     def _match_single_embedding(self, live_embedding, candidate_rolls=None):
         """
-        Calculates cosine similarity against all registered student centroids:
-        Cosine Similarity = dot(A, B) / (||A|| * ||B||)
-        Enforces:
-          1. Strict minimum similarity threshold (e.g. >= 0.65).
-          2. Ambiguity margin: ensures top match is clearly separated from 2nd closest student.
+        Calculates cosine similarity against registered student centroids.
+        Fix V04: Enforces candidate_rolls filtering when provided, restricting comparisons
+        strictly to the enrolled roster and preventing institutional DB ambiguity spikes.
         """
-        from src.database import get_student_info
         live_norm = live_embedding / (np.linalg.norm(live_embedding) + 1e-10)
         
+        # Fix V04: Restrict matching to candidate_rolls if supplied
+        if candidate_rolls is not None and len(candidate_rolls) > 0:
+            candidate_set = set(str(r).strip() for r in candidate_rolls)
+            target_centroids = {r: c for r, c in self.centroids.items() if str(r).strip() in candidate_set}
+            if not target_centroids:
+                target_centroids = self.centroids
+        else:
+            target_centroids = self.centroids
+
         all_similarities = []
-        for roll_number, centroid in self.centroids.items():
+        for roll_number, centroid in target_centroids.items():
             sim = float(np.dot(live_norm, centroid))
             all_similarities.append((roll_number, sim))
 
@@ -182,13 +198,13 @@ class FaceRecognizer:
         # Build top 5 matches with names
         top_5 = []
         for r, s in all_similarities[:5]:
-            info = get_student_info(r)
+            info = self._get_cached_student_info(r)
             name = info[1] if info else r
             top_5.append({"roll": r, "name": name, "sim": round(s, 4)})
 
-        top1_info = get_student_info(top1_roll)
+        top1_info = self._get_cached_student_info(top1_roll)
         top1_name = top1_info[1] if top1_info else top1_roll
-        top2_info = get_student_info(top2_roll) if top2_roll != "None" else None
+        top2_info = self._get_cached_student_info(top2_roll) if top2_roll != "None" else None
         top2_name = top2_info[1] if top2_info else top2_roll
 
         diag = {
@@ -234,8 +250,10 @@ class FaceRecognizer:
 
     def recognize_batch(self, face_crops, candidate_rolls=None):
         """
-        Batch vectorized ArcFace inference:
-        Processes multiple face crops in a single forward pass for high-speed crowd attendance.
+        True Batched Vectorized ArcFace Inference (Fix V06 & Fix V04):
+        Stacks crops into a single 4D tensor [B, 3, 112, 112], executes batched ONNX inference,
+        and vectorizes cosine similarity using matrix multiplication: np.dot(batch_embeddings, centroid_matrix.T).
+        Enforces candidate_rolls filtering when provided (Fix V04).
         """
         if not face_crops or not self.centroids:
             return [("Unknown", 0.0, {})] * len(face_crops)
@@ -243,35 +261,99 @@ class FaceRecognizer:
             valid_indices = []
             valid_crops = []
             for idx, crop in enumerate(face_crops):
-                if crop.shape[0] >= 20 and crop.shape[1] >= 20:
+                if crop is not None and crop.size > 0 and crop.shape[0] >= 20 and crop.shape[1] >= 20:
                     valid_indices.append(idx)
-                    valid_crops.append(crop)
+                    aligned = cv2.resize(crop, (112, 112), interpolation=cv2.INTER_CUBIC) if crop.shape[:2] != (112, 112) else crop
+                    valid_crops.append(aligned)
 
             if not valid_crops:
-                return [("Unknown", 0.0, {})] * len(face_crops)
+                return [("Unknown", 0.0, {"reason": "CROP_TOO_SMALL"})] * len(face_crops)
 
             output = [("Unknown", 0.0, {})] * len(face_crops)
 
-            # Fast Native ONNX ArcFace Inference
-            if self.onnx_rec is not None:
-                for res_idx, orig_idx in enumerate(valid_indices):
-                    crop = valid_crops[res_idx]
-                    aligned = cv2.resize(crop, (112, 112)) if crop.shape[:2] != (112, 112) else crop
-                    feat = self.onnx_rec.get_feat(aligned)
-                    if feat is not None and len(feat) > 0:
-                        vec = feat[0]
-                        norm = np.linalg.norm(vec)
-                        emb = vec / (norm + 1e-10) if norm > 0 else vec
-                        output[orig_idx] = self._match_single_embedding(emb, candidate_rolls=candidate_rolls)
-                return output
+            # Fix V04: Filter centroids by candidate_rolls
+            if candidate_rolls is not None and len(candidate_rolls) > 0:
+                candidate_set = set(str(r).strip() for r in candidate_rolls)
+                target_rolls = [r for r in self.centroids.keys() if str(r).strip() in candidate_set]
+                if not target_rolls:
+                    target_rolls = list(self.centroids.keys())
+            else:
+                target_rolls = list(self.centroids.keys())
 
-            # DeepFace Fallback
-            from deepface import DeepFace
-            batch_results = DeepFace.represent(valid_crops, model_name="ArcFace", enforce_detection=False)
-            for res_idx, orig_idx in enumerate(valid_indices):
-                if res_idx < len(batch_results):
-                    emb = np.array(batch_results[res_idx]["embedding"])
-                    output[orig_idx] = self._match_single_embedding(emb, candidate_rolls=candidate_rolls)
+            centroid_matrix = np.stack([self.centroids[r] for r in target_rolls])
+            centroid_matrix = centroid_matrix / (np.linalg.norm(centroid_matrix, axis=1, keepdims=True) + 1e-10)
+
+            # Fix V06: Batched 4D Tensor Inference [B, 3, 112, 112]
+            batch_embeddings = None
+            if self.onnx_rec is not None:
+                blob = cv2.dnn.blobFromImages(
+                    valid_crops, 1.0 / 127.5, (112, 112),
+                    (127.5, 127.5, 127.5), swapRB=True
+                )
+                if hasattr(self.onnx_rec, 'session') and self.onnx_rec.session is not None:
+                    raw_feats = self.onnx_rec.session.run(None, {self.onnx_rec.input_name: blob})[0]
+                else:
+                    raw_feats = self.onnx_rec.get_feat(valid_crops)
+
+                norms = np.linalg.norm(raw_feats, axis=1, keepdims=True) + 1e-10
+                batch_embeddings = raw_feats / norms
+
+            # DeepFace fallback if ONNX unavailable
+            if batch_embeddings is None:
+                from deepface import DeepFace
+                batch_results = DeepFace.represent(valid_crops, model_name="ArcFace", enforce_detection=False)
+                raw_list = [np.array(res["embedding"]) for res in batch_results]
+                batch_embeddings = np.stack(raw_list)
+                batch_embeddings = batch_embeddings / (np.linalg.norm(batch_embeddings, axis=1, keepdims=True) + 1e-10)
+
+            # Fix V06: Vectorized cosine similarity via single BLAS matrix multiply
+            # [B, 512] x [512, M] -> [B, M]
+            similarity_matrix = np.dot(batch_embeddings, centroid_matrix.T)
+
+            # Evaluate matches and ambiguity margins
+            for i, orig_idx in enumerate(valid_indices):
+                sims = similarity_matrix[i]
+                top_indices = np.argsort(-sims)
+                top1_idx = top_indices[0]
+                top1_roll = target_rolls[top1_idx]
+                top1_sim = float(sims[top1_idx])
+                top2_roll, top2_sim = (target_rolls[top_indices[1]], float(sims[top_indices[1]])) if len(top_indices) > 1 else ("None", 0.0)
+
+                top_5 = []
+                for idx_m in top_indices[:5]:
+                    r = target_rolls[idx_m]
+                    info = self._get_cached_student_info(r)
+                    name = info[1] if info else r
+                    top_5.append({"roll": r, "name": name, "sim": round(float(sims[idx_m]), 4)})
+
+                top1_info = self._get_cached_student_info(top1_roll)
+                top1_name = top1_info[1] if top1_info else top1_roll
+                top2_info = self._get_cached_student_info(top2_roll) if top2_roll != "None" else None
+                top2_name = top2_info[1] if top2_info else top2_roll
+
+                diag = {
+                    "top1_roll": top1_roll,
+                    "top1_name": top1_name,
+                    "top1_sim": round(top1_sim, 4),
+                    "top2_roll": top2_roll,
+                    "top2_name": top2_name,
+                    "top2_sim": round(top2_sim, 4),
+                    "margin": round(top1_sim - top2_sim, 4),
+                    "top_5": top_5
+                }
+
+                if top1_sim < self.min_similarity:
+                    diag["reason"] = f"SIMILARITY_BELOW_THRESHOLD ({top1_sim:.3f} < {self.min_similarity:.2f})"
+                    output[orig_idx] = ("Unknown", round(top1_sim * 100, 2), diag)
+                elif len(target_rolls) > 1 and (top1_sim - top2_sim) < self.ambiguity_margin:
+                    diag["reason"] = f"AMBIGUOUS_MATCH (Top1 {top1_name}={top1_sim:.2f} vs Top2 {top2_name}={top2_sim:.2f}, Margin={diag['margin']:.3f} < {self.ambiguity_margin:.2f})"
+                    output[orig_idx] = ("Unknown", round(top1_sim * 100, 2), diag)
+                else:
+                    confidence = round(min(100.0, (top1_sim / 1.0) * 100.0), 2)
+                    diag["reason"] = "VERIFIED_MATCH"
+                    output[orig_idx] = (top1_roll, confidence, diag)
+
             return output
-        except Exception:
+        except Exception as e:
+            print(f"[WARNING] recognize_batch fallback: {e}")
             return [self.recognize(c, candidate_rolls=candidate_rolls) for c in face_crops]

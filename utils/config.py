@@ -19,14 +19,15 @@ CONFIDENCE_THRESHOLD = 0.50
 ATTENDANCE_WINDOW_MINUTES = 15
 
 # Biometric & Computer Vision Quality Gates
-MIN_FACE_SIZE = 45               # Minimum face width/height in pixels (allows background/seated students)
-BLUR_THRESHOLD = 80.0            # Minimum Laplacian variance for motion blur rejection
+MIN_FACE_SIZE = 20               # Calibrated for high-density crowds / distant rows 5-8 (allows 20-35px bboxes)
+BLUR_THRESHOLD = 25.0            # Calibrated for indoor webcams (accepts normal clear indoor faces 25-45, rejects true blur < 20)
 MIN_BRIGHTNESS = 35.0            # Minimum average luminance (reject underexposed)
 MAX_BRIGHTNESS = 230.0           # Maximum average luminance (reject overexposed)
 MIN_CONTRAST = 18.0              # Minimum standard deviation of pixels (allows varied room lighting)
-MAX_YAW_RATIO = 0.42             # Landmark asymmetry cutoff: abs(NoseX - MidEyesX) / EyeDistance (tolerates natural head turns)
+MAX_YAW_RATIO = 0.50             # Roll-invariant landmark asymmetry cutoff (allows side-by-side seating angles up to 0.50)
 
 # SCRFD Detection & ArcFace Recognition Thresholds (Buffalo_M)
+DETECTION_SIZE = (1280, 1280)    # Configurable multi-scale detection size (e.g. 640x640 up to 1080x1920 / native)
 SCRFD_SCORE_THRESHOLD = 0.50     # SCRFD face detection confidence cutoff (detects distant/slanted faces)
 YUNET_SCORE_THRESHOLD = 0.60     # Legacy fallback cutoff
 ARCFACE_SIMILARITY_THRESHOLD = 0.52 # Optimized for distance (4-8m) while ambiguity margin guards against false swaps

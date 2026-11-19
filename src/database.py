@@ -887,8 +887,15 @@ def get_system_diagnostics():
         except:
             pass
 
-    yunet_exists = (BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx").exists()
+    scrfd_candidates = [
+        BASE_DIR / "models" / "buffalo_m" / "det_2.5g.onnx",
+        Path.home() / ".insightface" / "models" / "buffalo_m" / "det_2.5g.onnx"
+    ]
+    scrfd_exists = any(p.exists() for p in scrfd_candidates)
+
     arcface_candidates = [
+        BASE_DIR / "models" / "buffalo_m" / "w600k_r50.onnx",
+        Path.home() / ".insightface" / "models" / "buffalo_m" / "w600k_r50.onnx",
         BASE_DIR / "models" / ".deepface" / "weights" / "arcface_weights.h5",
         Path.home() / ".deepface" / "weights" / "arcface_weights.h5"
     ]
@@ -901,7 +908,7 @@ def get_system_diagnostics():
         "attendance_records": attendance_count,
         "db_size_kb": round(db_size_kb, 2),
         "embeddings_count": emb_count,
-        "yunet_weights": yunet_exists,
+        "scrfd_weights": scrfd_exists,
         "arcface_weights": arcface_exists
     }
 

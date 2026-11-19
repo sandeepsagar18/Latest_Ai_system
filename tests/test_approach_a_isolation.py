@@ -7,19 +7,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 class TestApproachAViewIsolation(unittest.TestCase):
-    @patch("gui.SmartClassApp.update_clock")
-    @patch("gui.SmartClassApp.refresh_dashboard_metrics")
-    def setUp(self, mock_refresh, mock_clock):
-        # Prevent starting infinite GUI loop or background timers during unit test
-        from gui import SmartClassApp
-        self.app = SmartClassApp()
-        self.app.withdraw()  # keep window hidden during automated headless test
+    @classmethod
+    def setUpClass(cls):
+        with patch("gui.SmartClassApp.update_clock"), patch("gui.SmartClassApp.refresh_dashboard_metrics"):
+            from gui import SmartClassApp
+            cls.app = SmartClassApp()
+            cls.app.withdraw()
 
-    def tearDown(self):
+    @classmethod
+    def tearDownClass(cls):
         try:
-            self.app.destroy()
+            cls.app.destroy()
         except:
             pass
+
 
     def test_state1_standby_kiosk_logged_out(self):
         """Logged out state: Standby kiosk hero is shown, all sensitive buttons/tabs are completely removed."""
