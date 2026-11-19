@@ -6,14 +6,14 @@ both high-score and low-score detection bounding boxes using a constant-velocity
 and linear assignment via Intersection-over-Union (IoU).
 
 Enhanced with:
-- Threshold-aware maximum cardinality linear assignment
+- Robust threshold-aware maximum cardinality linear assignment
 - Two-stage lifecycle confirmation for new tracks
-- Dynamic frame interval (dt) scaling for Kalman filter
-- Numerically stable Joseph-form covariance updates and symmetry enforcement
-- Strict coordinate and confidence validation
+- Dynamic frame interval (dt) validation & scaling for Kalman filter
+- Numerically stable Joseph-form covariance updates, Cholesky exception handling & symmetry enforcement
+- Strict coordinate, shape, and confidence validation
 - Independent per-tracker ID counter allocation
-- Bounded memory management for long-running tracking sessions
-- Mahalanobis motion gating and verified student identity tracking
+- Bounded memory management and clean immediate expired-track subtraction
+- Validated Mahalanobis motion gating and verified student identity tracking
 """
 
 import numpy as np
@@ -22,7 +22,7 @@ from scipy.optimize import linear_sum_assignment
 
 class KalmanFilterBox:
     """
-    A simple Kalman filter for tracking bounding boxes in image space.
+    A Kalman filter for tracking bounding boxes in image space.
     State: [x, y, a, h, vx, vy, va, vh]
     x, y: center of bounding box
     a: aspect ratio (w / h)
@@ -32,7 +32,7 @@ class KalmanFilterBox:
     def __init__(self, default_dt=1.0):
         self.ndim = 4
         self.default_dt = float(default_dt)
-        self._update_mat = np.eye(self.ndim, 2 * self.ndim)
+        self._update_mat = np.eye(self.ndim, 2 * self.ndim, dtype=float)
         self._std_weight_position = 1.0 / 20
         self._std_weight_velocity = 1.0 / 160
 
@@ -66,9 +66,13 @@ class KalmanFilterBox:
 
     def predict(self, mean, covariance, dt=1.0):
         """
-        Run Kalman filter prediction step with dynamic time interval dt.
+        Run Kalman filter prediction step with validated dynamic time interval dt.
+        Rejects NaN, infinite, negative, or excessively large dt values.
         """
-        dt = max(1e-4, float(dt))
+        if dt is None or not np.isfinite(dt) or dt <= 0.0 or dt > 10.0:
+            dt = 1.0
+        dt = float(dt)
+
         motion_mat = self.get_motion_mat(dt)
 
         std_pos = [
@@ -110,59 +114,79 @@ class KalmanFilterBox:
         """
         Kalman update step using Joseph-form covariance update for numerical stability:
         P = (I - K H) P (I - K H)^T + K R K^T
+        Safely catches Cholesky/singular matrix errors without crashing or corrupting state.
         """
-        measurement = np.asarray(measurement, dtype=float)
-        projected_mean, projected_cov = self.project(mean, covariance)
+        try:
+            measurement = np.asarray(measurement, dtype=float)
+            projected_mean, projected_cov = self.project(mean, covariance)
 
-        # Innovation covariance R
-        std = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
-            1e-1,
-            self._std_weight_position * mean[3]
-        ]
-        r_cov = np.diag(np.square(std))
+            # Innovation covariance R
+            std = [
+                self._std_weight_position * mean[3],
+                self._std_weight_position * mean[3],
+                1e-1,
+                self._std_weight_position * mean[3]
+            ]
+            r_cov = np.diag(np.square(std))
 
-        # Solve for Kalman Gain K: projected_cov * K^T = H * P^T => K = P H^T (projected_cov)^-1
-        chol_factor, lower = scipy_cholesky(projected_cov)
-        kalman_gain = scipy_solve_cholesky(chol_factor, lower, np.dot(covariance, self._update_mat.T).T).T
+            # Solve for Kalman Gain K: projected_cov * K^T = H * P^T => K = P H^T (projected_cov)^-1
+            chol_factor, lower = scipy_cholesky(projected_cov)
+            kalman_gain = scipy_solve_cholesky(chol_factor, lower, np.dot(covariance, self._update_mat.T).T).T
 
-        innovation = measurement - projected_mean
-        new_mean = mean + np.dot(innovation, kalman_gain.T)
+            innovation = measurement - projected_mean
+            new_mean = mean + np.dot(innovation, kalman_gain.T)
 
-        # Joseph form: (I - K H) P (I - K H)^T + K R K^T
-        i_kh = np.eye(8) - np.dot(kalman_gain, self._update_mat)
-        new_covariance = np.linalg.multi_dot((i_kh, covariance, i_kh.T)) + np.linalg.multi_dot((kalman_gain, r_cov, kalman_gain.T))
+            # Joseph form: (I - K H) P (I - K H)^T + K R K^T
+            i_kh = np.eye(8) - np.dot(kalman_gain, self._update_mat)
+            new_covariance = np.linalg.multi_dot((i_kh, covariance, i_kh.T)) + np.linalg.multi_dot((kalman_gain, r_cov, kalman_gain.T))
 
-        # Ensure symmetry and finite positive values
-        new_covariance = 0.5 * (new_covariance + new_covariance.T)
-        np.fill_diagonal(new_covariance, np.maximum(np.diag(new_covariance), 1e-6))
+            # Ensure symmetry and positive diagonal variances
+            new_covariance = 0.5 * (new_covariance + new_covariance.T)
+            np.fill_diagonal(new_covariance, np.maximum(np.diag(new_covariance), 1e-6))
 
-        if not (np.all(np.isfinite(new_mean)) and np.all(np.isfinite(new_covariance))):
-            # Fallback to previous mean and covariance if numerical instability occurred
+            if not (np.all(np.isfinite(new_mean)) and np.all(np.isfinite(new_covariance))):
+                return mean, covariance
+
+            return new_mean, new_covariance
+        except Exception:
+            # On Cholesky decomposition or numerical failure, return safe existing state
             return mean, covariance
-
-        return new_mean, new_covariance
 
     def gating_distance(self, mean, covariance, measurements, only_position=False):
         """
-        Computes Mahalanobis distance between state and measurements.
-        measurements: [N, 4] (x, y, a, h)
-        Returns: [N] squared Mahalanobis distance
+        Computes Mahalanobis distance between predicted track state and measurements.
+        measurements: [N, 4] (x, y, a, h) or [N, 2] if only_position is True.
+        Returns: [N] squared Mahalanobis distances.
         """
+        measurements = np.atleast_2d(np.asarray(measurements, dtype=float))
+        if measurements.shape[0] == 0:
+            return np.empty((0,), dtype=float)
+
         projected_mean, projected_cov = self.project(mean, covariance)
         if only_position:
             projected_mean = projected_mean[:2]
             projected_cov = projected_cov[:2, :2]
-            measurements = np.asarray(measurements)[:, :2]
+            measurements = measurements[:, :2]
         else:
-            measurements = np.asarray(measurements)[:, :4]
+            projected_mean = projected_mean[:4]
+            projected_cov = projected_cov[:4, :4]
+            measurements = measurements[:, :4]
 
-        cholesky_factor = np.linalg.cholesky(projected_cov)
-        d = measurements - projected_mean
-        z = scipy_solve_cholesky((cholesky_factor, True), True, d.T)
-        squared_maha = np.sum(d * z.T, axis=1)
-        return squared_maha
+        try:
+            chol_factor, lower = scipy_cholesky(projected_cov)
+            diff = measurements - projected_mean
+            z = scipy_solve_cholesky(chol_factor, lower, diff.T)
+            squared_maha = np.sum(diff * z.T, axis=1)
+            return squared_maha
+        except Exception:
+            # Fallback to direct pseudo-inverse if Cholesky encounters degenerate condition
+            try:
+                diff = measurements - projected_mean
+                inv_cov = np.linalg.pinv(projected_cov)
+                squared_maha = np.sum(np.dot(diff, inv_cov) * diff, axis=1)
+                return squared_maha
+            except Exception:
+                return np.full((measurements.shape[0],), 1e5, dtype=float)
 
 
 def scipy_cholesky(a):
@@ -170,9 +194,9 @@ def scipy_cholesky(a):
     return scipy.linalg.cho_factor(a, lower=True, check_finite=False)
 
 
-def scipy_solve_cholesky(c, lower, b):
+def scipy_solve_cholesky(chol_factor, lower, b):
     import scipy.linalg
-    return scipy.linalg.cho_solve((c, lower), b, check_finite=False)
+    return scipy.linalg.cho_solve((chol_factor, lower), b, check_finite=False)
 
 
 def validate_detection(f):
@@ -184,8 +208,23 @@ def validate_detection(f):
         return False, None, 0.0
 
     coords = f.get("coords")
-    if coords is None or len(coords) != 4:
+    if coords is None:
         return False, None, 0.0
+
+    # Ensure coords is a flat sequence or 1D list/tuple/numpy array of exactly 4 numbers
+    if not isinstance(coords, (list, tuple, np.ndarray)):
+        return False, None, 0.0
+
+    if isinstance(coords, np.ndarray):
+        if coords.ndim != 1 or coords.size != 4:
+            return False, None, 0.0
+    else:
+        if len(coords) != 4:
+            return False, None, 0.0
+        # Check that individual elements are not lists/tuples
+        for c in coords:
+            if isinstance(c, (list, tuple, dict, set, np.ndarray)):
+                return False, None, 0.0
 
     try:
         x1, y1, x2, y2 = [float(c) for c in coords]
@@ -196,7 +235,7 @@ def validate_detection(f):
     if not (np.isfinite(x1) and np.isfinite(y1) and np.isfinite(x2) and np.isfinite(y2)):
         return False, None, 0.0
 
-    # Dimension and ordering check
+    # Dimension and ordering check: x2 > x1 and y2 > y1
     w = x2 - x1
     h = y2 - y1
     if w <= 0.0 or h <= 0.0:
@@ -226,14 +265,24 @@ def bbox_to_z(bbox):
 
 
 def z_to_bbox(z):
-    """Converts [x_center, y_center, aspect_ratio, height] to [x1, y1, x2, y2]."""
-    w = z[2] * z[3]
-    h = z[3]
-    x1 = z[0] - w / 2.0
-    y1 = z[1] - h / 2.0
-    x2 = z[0] + w / 2.0
-    y2 = z[1] + h / 2.0
-    return np.array([x1, y1, x2, y2])
+    """
+    Converts [x_center, y_center, aspect_ratio, height] to [x1, y1, x2, y2].
+    Guarantees valid, finite, positive bounding boxes.
+    """
+    if z is None or len(z) < 4 or not np.all(np.isfinite(z[:4])):
+        return np.array([0.0, 0.0, 1.0, 1.0], dtype=float)
+
+    xc, yc, a, h = float(z[0]), float(z[1]), float(z[2]), float(z[3])
+    # Enforce positive aspect ratio and positive height
+    a = max(1e-4, a)
+    h = max(1.0, h)
+    w = max(1.0, a * h)
+
+    x1 = xc - w / 2.0
+    y1 = yc - h / 2.0
+    x2 = xc + w / 2.0
+    y2 = yc + h / 2.0
+    return np.array([x1, y1, x2, y2], dtype=float)
 
 
 def iou_batch(bboxes1, bboxes2):
@@ -244,13 +293,19 @@ def iou_batch(bboxes1, bboxes2):
     Returns: [N, M] cost matrix (1.0 - IoU)
     """
     if len(bboxes1) == 0 or len(bboxes2) == 0:
-        return np.empty((len(bboxes1), len(bboxes2)))
+        return np.empty((len(bboxes1), len(bboxes2)), dtype=float)
 
     b1 = np.ascontiguousarray(bboxes1, dtype=float)
     b2 = np.ascontiguousarray(bboxes2, dtype=float)
 
-    area1 = (b1[:, 2] - b1[:, 0]) * (b1[:, 3] - b1[:, 1])
-    area2 = (b2[:, 2] - b2[:, 0]) * (b2[:, 3] - b2[:, 1])
+    # Validate coordinate ordering to avoid negative areas
+    b1_w = np.maximum(0.0, b1[:, 2] - b1[:, 0])
+    b1_h = np.maximum(0.0, b1[:, 3] - b1[:, 1])
+    b2_w = np.maximum(0.0, b2[:, 2] - b2[:, 0])
+    b2_h = np.maximum(0.0, b2[:, 3] - b2[:, 1])
+
+    area1 = b1_w * b1_h
+    area2 = b2_w * b2_h
 
     iw = np.maximum(0.0, np.minimum(b1[:, 2][:, None], b2[:, 2]) - np.maximum(b1[:, 0][:, None], b2[:, 0]))
     ih = np.maximum(0.0, np.minimum(b1[:, 3][:, None], b2[:, 3]) - np.maximum(b1[:, 1][:, None], b2[:, 1]))
@@ -295,7 +350,11 @@ class STrack:
     def tlbr(self):
         if self.mean is None:
             return self._tlbr
-        return z_to_bbox(self.mean[:4])
+        box = z_to_bbox(self.mean[:4])
+        # If Kalman state yielded an invalid or non-finite box, fallback to last observed box
+        if not np.all(np.isfinite(box)) or box[2] <= box[0] or box[3] <= box[1]:
+            return self._tlbr
+        return box
 
     def predict(self, dt=1.0):
         if self.mean is None:
@@ -345,6 +404,7 @@ class STrack:
             self.track_id = track_id if track_id is not None else STrack.next_id()
         self.score = new_track.score
         self.face_data = new_track.face_data
+        self._tlbr = new_track.tlbr
         self.time_since_update = 0
 
     def update(self, new_track, frame_id):
@@ -360,6 +420,7 @@ class STrack:
         self.is_activated = True
         self.score = new_track.score
         self.face_data = new_track.face_data
+        self._tlbr = new_track.tlbr
         self.time_since_update = 0
 
     def mark_lost(self):
@@ -383,31 +444,34 @@ class STrack:
 
 def linear_assignment(cost_matrix, thresh):
     """
-    Threshold-aware linear assignment that maximizes the number of valid matches.
+    Threshold-aware linear assignment that guarantees maximum valid associations.
     
     Standard linear_sum_assignment finds a global minimum weight matching without knowing
-    the threshold cutoff. Under competitive costs, an edge with high cost (<= thresh)
-    could prevent another match from forming, or choose a pairing that leaves a valid edge
-    rejected by the cutoff.
+    the threshold cutoff. Under competitive costs, an edge exceeding threshold can block
+    two valid edges.
     
-    Fix:
-    Mask pairs exceeding the threshold with a heavy penalty (1e5).
-    By assigning cost = C_ij for C_ij <= thresh, and cost = C_ij + 100000 for C_ij > thresh,
-    the Hungarian algorithm prioritizes maximizing valid matches (edges <= thresh) before
-    minimizing cost. Any pair whose matched cost is > thresh is then placed in unmatched.
+    To guarantee that the Hungarian algorithm prioritizes maximizing the number of valid
+    matches (cost <= thresh) over minimizing cost, we compute a dynamic Big-M penalty:
+        M = 2.0 * max(num_rows, num_cols) * max(thresh, 1.0) + 10.0
+    For any cell where cost_matrix[i, j] > thresh, adjusted_cost[i, j] = cost_matrix[i, j] + M.
+    This guarantees that choosing one invalid match costs more than any valid matching configuration.
+    Pairs exceeding thresh are then assigned to unmatched collections.
     """
-    if cost_matrix.size == 0:
+    cost_matrix = np.asarray(cost_matrix, dtype=float)
+    if cost_matrix.size == 0 or cost_matrix.shape[0] == 0 or cost_matrix.shape[1] == 0:
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
 
-    penalty = 1e5
+    n_rows, n_cols = cost_matrix.shape
+    penalty = 2.0 * max(n_rows, n_cols) * max(float(thresh), 1.0) + 10.0
+
     adjusted_cost = np.copy(cost_matrix)
     invalid_mask = cost_matrix > thresh
     adjusted_cost[invalid_mask] += penalty
 
     row_ind, col_ind = linear_sum_assignment(adjusted_cost)
     matches = []
-    unmatched_a = set(range(cost_matrix.shape[0]))
-    unmatched_b = set(range(cost_matrix.shape[1]))
+    unmatched_a = set(range(n_rows))
+    unmatched_b = set(range(n_cols))
 
     for r, c in zip(row_ind, col_ind):
         if cost_matrix[r, c] <= thresh:
@@ -434,13 +498,23 @@ class ByteTracker:
     - match_thresh: float (default 0.70). Maximum 1 - IoU distance for association.
     - track_buffer: int (default 30). Number of frames to keep lost tracks before removal.
     - max_removed_buffer: int (default 500). Max historical removed tracks to retain in memory.
+    - use_motion_gating: bool (default False). Whether to apply Mahalanobis gating to prune distant candidates.
     """
-    def __init__(self, track_thresh=0.50, low_thresh=0.10, match_thresh=0.70, track_buffer=30, max_removed_buffer=500):
+    def __init__(
+        self,
+        track_thresh=0.50,
+        low_thresh=0.10,
+        match_thresh=0.70,
+        track_buffer=30,
+        max_removed_buffer=500,
+        use_motion_gating=False
+    ):
         self.track_thresh = track_thresh
         self.low_thresh = low_thresh
         self.match_thresh = match_thresh
         self.track_buffer = track_buffer
         self.max_removed_buffer = max_removed_buffer
+        self.use_motion_gating = use_motion_gating
 
         self.frame_id = 0
         self._next_track_id = 0
@@ -471,21 +545,27 @@ class ByteTracker:
         lost_stracks = []
         removed_stracks = []
 
+        # Validate dt
+        if dt is None or not np.isfinite(dt) or dt <= 0.0 or dt > 10.0:
+            dt = 1.0
+        dt = float(dt)
+
         # 0. Validate incoming detections and split into High (>= track_thresh),
         # Low (low_thresh <= score < track_thresh), and Discard (< low_thresh)
         detections_high = []
         detections_low = []
 
-        for f in detected_faces:
-            valid, bbox, score = validate_detection(f)
-            if not valid or score < self.low_thresh:
-                continue
+        if detected_faces and isinstance(detected_faces, (list, tuple)):
+            for f in detected_faces:
+                valid, bbox, score = validate_detection(f)
+                if not valid or score < self.low_thresh:
+                    continue
 
-            strack = STrack(bbox, score, face_data=f)
-            if score >= self.track_thresh:
-                detections_high.append(strack)
-            else:
-                detections_low.append(strack)
+                strack = STrack(bbox, score, face_data=f)
+                if score >= self.track_thresh:
+                    detections_high.append(strack)
+                else:
+                    detections_low.append(strack)
 
         # 1. Partition existing tracks: unconfirmed vs confirmed tracked
         unconfirmed = []
@@ -503,6 +583,18 @@ class ByteTracker:
 
         # 3. First association: Match tracked + lost pool with HIGH score detections
         cost_matrix = iou_batch([s.tlbr for s in strack_pool], [d.tlbr for d in detections_high])
+        
+        # Optional Mahalanobis motion gating to prune physically impossible jumps
+        if self.use_motion_gating and cost_matrix.size > 0:
+            gating_threshold = 14.45  # Chi-squared 4-DOF 99.5% confidence limit
+            for i, s in enumerate(strack_pool):
+                if s.mean is not None and s.covariance is not None and len(detections_high) > 0:
+                    meas = [bbox_to_z(d.tlbr) for d in detections_high]
+                    dists = s.shared_kalman.gating_distance(s.mean, s.covariance, meas)
+                    for j, dist in enumerate(dists):
+                        if dist > gating_threshold:
+                            cost_matrix[i, j] = 1.0
+
         matches, u_track, u_detection = linear_assignment(cost_matrix, thresh=self.match_thresh)
 
         for itracked, idet in matches:
@@ -567,12 +659,16 @@ class ByteTracker:
                 track.mark_removed()
                 removed_stracks.append(track)
 
-        # 8. Consolidate and update tracker states
+        # 8. Consolidate and update tracker states:
+        # Crucial bug fix: immediately purge newly removed_stracks from self.lost_stracks
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked or t.state == TrackState.New]
         self.tracked_stracks = joint_stracks(self.tracked_stracks, activated_stracks)
         self.tracked_stracks = joint_stracks(self.tracked_stracks, refind_stracks)
+
         self.lost_stracks = sub_stracks(self.lost_stracks, self.tracked_stracks)
         self.lost_stracks.extend(lost_stracks)
+        # Purge both historical and newly removed tracks from active lost pool
+        self.lost_stracks = sub_stracks(self.lost_stracks, removed_stracks)
         self.lost_stracks = sub_stracks(self.lost_stracks, self.removed_stracks)
 
         # Bounded removed tracks to prevent memory leak

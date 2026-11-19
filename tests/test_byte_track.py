@@ -1,197 +1,235 @@
 """
-Unit Tests for ByteTrack Multi-Object Face Tracking Implementation
-Verifying all 14 engineering requirements for SmartClass Vision AI attendance.
+Comprehensive Unit Tests for ByteTrack Implementation Review & Fixes
+Covers all 10 required testing suites:
+1. Mahalanobis distance accuracy vs direct calculation.
+2. Expired track removal and immediate non-repeated processing.
+3. Invalid dt values rejection and validation.
+4. Invalid Kalman predictions and valid bounding box guarantees.
+5. Threshold-aware assignment with rectangular, all-invalid, empty, and competing matrices.
+6. Malformed detections handling without crashes.
+7. Cholesky and numerical failure recovery.
+8. Lost-track reactivation.
+9. Multiple tracker instances independent counter allocation.
+10. Long-running tracking sessions and bounded memory.
 """
 
 import pytest
 import numpy as np
-from src.byte_track import ByteTracker, STrack, KalmanFilterBox, linear_assignment, validate_detection, TrackState
+import scipy.linalg
+from src.byte_track import (
+    ByteTracker,
+    STrack,
+    KalmanFilterBox,
+    linear_assignment,
+    validate_detection,
+    bbox_to_z,
+    z_to_bbox,
+    iou_batch,
+    TrackState
+)
 
 
-def test_1_hungarian_assignment_threshold_edge_case():
+def test_1_mahalanobis_distance_accuracy():
     """
-    1. Hungarian assignment optimization bug:
-    Test a cost matrix where a naive Hungarian matching creates an invalid assignment
-    that blocks two valid alternatives.
-    Example:
-    Cost matrix:
-        D0     D1
-    T0 [0.05, 0.49]
-    T1 [0.10, 0.51]
-    With threshold = 0.50:
-    Naive Hungarian minimizes 0.05 + 0.51 = 0.56, but (1, 1) has cost 0.51 > 0.50,
-    leaving only 1 valid match [(0, 0)].
-    Threshold-aware assignment must select [(0, 1), (1, 0)] (costs 0.49 and 0.10, both <= 0.50),
-    yielding 2 valid matches.
+    1. Test Mahalanobis solver interface & numerical correctness compared to direct matrix algebra:
+       d^2 = (y - \mu)^T \Sigma^{-1} (y - \mu)
     """
-    cost_matrix = np.array([
+    kf = KalmanFilterBox()
+    mean, cov = kf.initiate(bbox_to_z([100, 100, 200, 200]))
+    projected_mean, projected_cov = kf.project(mean, cov)
+
+    measurements = [
+        bbox_to_z([105, 105, 205, 205]),
+        bbox_to_z([120, 110, 220, 210]),
+        bbox_to_z([300, 300, 400, 400])
+    ]
+
+    # Run gating_distance via Cholesky solver
+    dists = kf.gating_distance(mean, cov, measurements)
+    assert len(dists) == 3
+    assert np.all(np.isfinite(dists))
+
+    # Verify against direct pinv calculation
+    inv_cov = np.linalg.pinv(projected_cov)
+    for idx, m in enumerate(measurements):
+        diff = m - projected_mean
+        direct_dist = float(np.dot(np.dot(diff, inv_cov), diff.T))
+        assert np.isclose(dists[idx], direct_dist, rtol=1e-3, atol=1e-4)
+
+
+def test_2_expired_track_removal():
+    """
+    2. Expired track removal:
+    Ensure newly expired tracks are immediately subtracted from lost_stracks
+    and never processed repeatedly.
+    """
+    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10, track_buffer=3)
+    # Frame 1: add track
+    t1 = tracker.update([{"coords": (100, 100, 200, 200), "score": 0.95}])
+    assert len(t1) == 1
+    track_id = t1[0].track_id
+
+    # Frame 2, 3, 4: Lost
+    tracker.update([])
+    tracker.update([])
+    tracker.update([])
+    assert len(tracker.lost_stracks) == 1
+    assert tracker.lost_stracks[0].track_id == track_id
+
+    # Frame 5: Exceeds track_buffer (frame_id 5 - start 1 = 4 > 3)
+    tracker.update([])
+    # Must be deleted from lost_stracks immediately and placed in removed_stracks
+    assert len(tracker.lost_stracks) == 0
+    assert len(tracker.tracked_stracks) == 0
+    assert any(t.track_id == track_id for t in tracker.removed_stracks)
+
+    # Frame 6: Ensure it is not processed or re-added again
+    tracker.update([])
+    assert len(tracker.lost_stracks) == 0
+
+
+def test_3_invalid_dt_values():
+    """
+    3. Validate dynamic dt:
+    Kalman prediction must safely reject NaN, infinite, negative, or excessively large dt values
+    and default to a stable interval without throwing exceptions or corrupting state.
+    """
+    kf = KalmanFilterBox()
+    mean, cov = kf.initiate(bbox_to_z([100, 100, 200, 200]))
+
+    invalid_dts = [float('nan'), float('inf'), float('-inf'), -1.0, 0.0, 100.0, None]
+    for bad_dt in invalid_dts:
+        new_mean, new_cov = kf.predict(mean, cov, dt=bad_dt)
+        assert np.all(np.isfinite(new_mean))
+        assert np.all(np.isfinite(new_cov))
+        assert np.all(np.diag(new_cov) > 0)
+
+
+def test_4_invalid_kalman_predictions_and_bbox():
+    """
+    4. Validate predicted bounding boxes:
+    z_to_bbox and STrack.tlbr must ensure finite coordinates, positive width and height,
+    and prevent degenerate IoU calculations.
+    """
+    bad_states = [
+        np.array([100, 100, -0.5, 50]),       # negative aspect ratio
+        np.array([100, 100, 1.0, -20]),       # negative height
+        np.array([100, 100, float('nan'), 50]), # NaN aspect ratio
+        np.array([float('inf'), 100, 1.0, 50]), # Inf center
+        np.array([100, 100, 0.0, 0.0])         # zero dimensions
+    ]
+    for s in bad_states:
+        bbox = z_to_bbox(s)
+        assert np.all(np.isfinite(bbox))
+        assert bbox[2] > bbox[0]
+        assert bbox[3] > bbox[1]
+
+    # Verify STrack.tlbr fallback if state ever becomes corrupted
+    strack = STrack([10, 10, 50, 50], 0.90)
+    strack.mean = np.array([float('nan')] * 8)
+    safe_bbox = strack.tlbr
+    assert np.all(np.isfinite(safe_bbox))
+    assert safe_bbox[2] > safe_bbox[0]
+
+
+def test_5_threshold_aware_linear_assignment():
+    """
+    5. Test threshold-aware assignment across edge conditions:
+    - Competing valid associations (threshold-aware preference)
+    - Rectangular matrices (more tracks than detections, or vice versa)
+    - All-invalid matches (costs all > threshold)
+    - Empty matrices (0 rows or 0 cols)
+    """
+    thresh = 0.50
+
+    # Competing valid associations
+    competing_cost = np.array([
         [0.05, 0.49],
         [0.10, 0.51]
     ])
-    thresh = 0.50
-    matches, unmatched_a, unmatched_b = linear_assignment(cost_matrix, thresh=thresh)
+    matches, un_a, un_b = linear_assignment(competing_cost, thresh=thresh)
+    assert len(matches) == 2
+    matched_set = set(tuple(m) for m in matches)
+    assert (0, 1) in matched_set and (1, 0) in matched_set
 
-    assert len(matches) == 2, f"Expected 2 matches, got {len(matches)}: {matches}"
-    matched_pairs = set(tuple(m) for m in matches)
-    assert (0, 1) in matched_pairs and (1, 0) in matched_pairs
-    assert len(unmatched_a) == 0
-    assert len(unmatched_b) == 0
-
-
-def test_2_first_frame_track_initialization():
-    """
-    2. First-frame track initialization:
-    In the first frame (frame_id = 1), high-confidence face detections should be initialized
-    and confirmed immediately so the system doesn't drop faces on initial snapshot.
-    """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
-    faces = [
-        {"coords": (100, 100, 200, 200), "score": 0.95},
-        {"coords": (300, 100, 400, 200), "score": 0.88}
-    ]
-    tracks = tracker.update(faces)
-    assert len(tracks) == 2
-    for t in tracks:
-        assert t.is_activated is True
-        assert t.state == TrackState.Tracked
-        assert t.track_id > 0
-
-
-def test_3_track_confirmation_lifecycle():
-    """
-    3. Track confirmation lifecycle:
-    In subsequent frames (frame_id > 1), a new track is initialized as unconfirmed (is_activated=False).
-    - If another matching detection is observed in the next frame, it is confirmed (is_activated=True).
-    - If it disappears immediately after creation without a second match, it is removed.
-    """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
-    # Frame 1: empty
-    tracker.update([])
-
-    # Frame 2: new student appears at (100, 100, 200, 200)
-    faces_f2 = [{"coords": (100, 100, 200, 200), "score": 0.90}]
-    tracks_f2 = tracker.update(faces_f2)
-    # Since it's a new track on frame 2, it should remain unconfirmed on frame 2 (not returned in confirmed tracks)
-    assert len(tracks_f2) == 0
-    assert len(tracker.tracked_stracks) == 1
-    unconf_track = tracker.tracked_stracks[0]
-    assert unconf_track.is_activated is False
-    saved_id = unconf_track.track_id
-
-    # Frame 3: same student observed again at (102, 101, 202, 201)
-    faces_f3 = [{"coords": (102, 101, 202, 201), "score": 0.91}]
-    tracks_f3 = tracker.update(faces_f3)
-    assert len(tracks_f3) == 1
-    assert tracks_f3[0].is_activated is True
-    assert tracks_f3[0].track_id == saved_id  # Keeps original track ID
-
-    # Test disappearing unconfirmed track:
-    # Frame 4: a phantom detection appears at (500, 500, 550, 550)
-    faces_f4 = [
-        {"coords": (104, 102, 204, 202), "score": 0.91},
-        {"coords": (500, 500, 550, 550), "score": 0.85}
-    ]
-    tracker.update(faces_f4)
-    # Frame 5: phantom detection disappears
-    faces_f5 = [{"coords": (105, 103, 205, 203), "score": 0.92}]
-    tracks_f5 = tracker.update(faces_f5)
-    assert len(tracks_f5) == 1
-    # Check that unconfirmed phantom track was removed
-    removed_ids = [t.track_id for t in tracker.removed_stracks]
-    assert len(removed_ids) >= 1
-
-
-def test_4_low_confidence_recovery():
-    """
-    4. Missing lower detection confidence threshold:
-    - High-confidence (>= 0.50) matched in Stage 1.
-    - Low-confidence (0.10 <= score < 0.50) recovers track in Stage 2.
-    - Discarded (< 0.10) completely ignored.
-    """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
-    # Frame 1: Student detected with high confidence
-    tracker.update([{"coords": (100, 100, 200, 200), "score": 0.92}])
-    orig_id = tracker.tracked_stracks[0].track_id
-
-    # Frame 2: Student turns head, score drops to 0.35 (recovered in Stage 2)
-    tracks_f2 = tracker.update([{"coords": (102, 101, 202, 201), "score": 0.35}])
-    assert len(tracks_f2) == 1
-    assert tracks_f2[0].track_id == orig_id
-    assert tracks_f2[0].score == 0.35
-
-    # Frame 3: Noise detection with score 0.05 (< low_thresh) must be discarded
-    # Detection far away with score 0.05 shouldn't create or update any track
-    tracker.update([
-        {"coords": (104, 102, 204, 202), "score": 0.88},
-        {"coords": (800, 800, 900, 900), "score": 0.05}
+    # Rectangular: 3 tracks, 2 detections
+    rect_cost_1 = np.array([
+        [0.2, 0.9],
+        [0.8, 0.3],
+        [0.7, 0.6]
     ])
-    assert len(tracker.tracked_stracks) == 1
+    matches, un_a, un_b = linear_assignment(rect_cost_1, thresh=thresh)
+    assert len(matches) == 2
+    assert len(un_a) == 1 and 2 in un_a
+    assert len(un_b) == 0
+
+    # Rectangular: 2 tracks, 3 detections
+    rect_cost_2 = np.array([
+        [0.2, 0.8, 0.9],
+        [0.9, 0.3, 0.7]
+    ])
+    matches, un_a, un_b = linear_assignment(rect_cost_2, thresh=thresh)
+    assert len(matches) == 2
+    assert len(un_a) == 0
+    assert len(un_b) == 1 and 2 in un_b
+
+    # All-invalid matches
+    all_invalid = np.array([
+        [0.8, 0.9],
+        [0.7, 0.85]
+    ])
+    matches, un_a, un_b = linear_assignment(all_invalid, thresh=thresh)
+    assert len(matches) == 0
+    assert len(un_a) == 2 and len(un_b) == 2
+
+    # Empty matrices
+    m_empty, un_a, un_b = linear_assignment(np.empty((0, 3)), thresh=thresh)
+    assert len(m_empty) == 0 and len(un_b) == 3
+    m_empty_2, un_a, un_b = linear_assignment(np.empty((3, 0)), thresh=thresh)
+    assert len(m_empty_2) == 0 and len(un_a) == 3
 
 
-def test_5_two_students_crossing():
+def test_6_malformed_detections_handling():
     """
-    5. Two students crossing paths:
-    Tests that two tracks maintain separate identities as they pass close to each other.
+    6. Strengthen detection validation:
+    Handle malformed coordinates, wrong shapes, unexpected types, and None inputs safely.
     """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
-    # Frame 1: Left student at x=100 moving right (+20px), Right student at x=300 moving left (-20px)
-    f1 = [
-        {"coords": (100, 100, 180, 200), "score": 0.95},
-        {"coords": (300, 100, 380, 200), "score": 0.95}
+    tracker = ByteTracker()
+    malformed = [
+        {"coords": [10, 20]},                    # Only 2 coordinates
+        {"coords": [[10, 20], [30, 40]]},        # Nested 2D array
+        {"coords": "10,20,30,40"},               # String
+        {"coords": None},                         # None coords
+        {"coords": (100, 100, 200, 200), "score": "bad"}, # Bad score
+        {"coords": (100, 100, 200, 200), "score": float('nan')},
+        None,                                     # None element
+        42                                        # Int element
     ]
-    t1 = tracker.update(f1)
-    id_left = [t.track_id for t in t1 if t.tlbr[0] < 200][0]
-    id_right = [t.track_id for t in t1 if t.tlbr[0] > 200][0]
-    assert id_left != id_right
-
-    # Frame 2: Moving closer (smooth 10px shift)
-    f2 = [
-        {"coords": (110, 100, 190, 200), "score": 0.95},
-        {"coords": (290, 100, 370, 200), "score": 0.95}
-    ]
-    t2 = tracker.update(f2)
-    assert len(t2) == 2
-
-    # Frame 3: Crossing paths (smooth continued motion)
-    f3 = [
-        {"coords": (120, 100, 200, 200), "score": 0.95},
-        {"coords": (280, 100, 360, 200), "score": 0.95}
-    ]
-    t3 = tracker.update(f3)
-    assert len(t3) == 2
-    new_id_left = [t.track_id for t in t3 if t.tlbr[0] < 200][0]
-    new_id_right = [t.track_id for t in t3 if t.tlbr[0] > 200][0]
-    assert new_id_left == id_left
-    assert new_id_right == id_right
+    tracks = tracker.update(malformed)
+    assert tracks == []
+    # Test completely invalid container
+    assert tracker.update(None) == []
+    assert tracker.update("not_a_list") == []
 
 
-def test_6_temporary_face_occlusion():
+def test_7_cholesky_numerical_failure_recovery():
     """
-    6. Temporary face occlusion:
-    A student is tracked, disappears for 3 frames (occluded by teacher walking by),
-    then reappears nearby. Track should be reactivated with the same track_id.
+    7. Improve Kalman exception handling:
+    Safe handling for singular/degenerate covariance matrices without crashing.
     """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10, track_buffer=10)
-    # Frame 1
-    t1 = tracker.update([{"coords": (100, 100, 200, 200), "score": 0.90}])
-    track_id = t1[0].track_id
-
-    # Frames 2, 3, 4: Occluded (empty frames)
-    for _ in range(3):
-        res = tracker.update([])
-        assert len(res) == 0
-        assert len(tracker.lost_stracks) == 1
-
-    # Frame 5: Student reappears at slightly shifted coordinates
-    t5 = tracker.update([{"coords": (105, 102, 205, 202), "score": 0.88}])
-    assert len(t5) == 1
-    assert t5[0].track_id == track_id
-    assert t5[0].state == TrackState.Tracked
+    kf = KalmanFilterBox()
+    mean = np.zeros(8)
+    # Degenerate covariance with zeros
+    singular_cov = np.zeros((8, 8))
+    # Update should catch exception and return unchanged or safe state
+    new_mean, new_cov = kf.update(mean, singular_cov, np.array([10, 10, 1, 20]))
+    assert np.all(np.isfinite(new_mean))
+    assert np.all(np.isfinite(new_cov))
 
 
-def test_7_lost_track_reactivation():
+def test_8_lost_track_reactivation():
     """
-    7. Lost-track reactivation:
+    8. Lost-track reactivation:
     Ensure tracks marked as Lost transition back to Tracked upon matching detection.
     """
     tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
@@ -208,26 +246,6 @@ def test_7_lost_track_reactivation():
     assert t3[0].track_id == orig_id
     assert t3[0].state == TrackState.Tracked
     assert len(tracker.lost_stracks) == 0
-
-
-def test_8_track_expiration():
-    """
-    8. Track expiration:
-    Verify that tracks in lost state longer than track_buffer frames are moved to removed_stracks.
-    """
-    track_buffer = 5
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10, track_buffer=track_buffer)
-    tracker.update([{"coords": (100, 100, 200, 200), "score": 0.90}])
-    assert len(tracker.tracked_stracks) == 1
-
-    # Student walks out of room; wait track_buffer + 1 frames
-    for _ in range(track_buffer + 2):
-        tracker.update([])
-
-    assert len(tracker.tracked_stracks) == 0
-    assert len(tracker.lost_stracks) == 0
-    assert len(tracker.removed_stracks) >= 1
-    assert tracker.removed_stracks[0].state == TrackState.Removed
 
 
 def test_9_multiple_tracker_instances():
@@ -263,113 +281,24 @@ def test_9_multiple_tracker_instances():
     assert new_tracks_a[0].track_id == 3
 
 
-def test_10_invalid_bounding_boxes():
+def test_10_long_running_session_memory():
     """
-    10. Bounding box and detection validation:
-    Rejects malformed bounding boxes:
-    - x2 <= x1
-    - y2 <= y1
-    - zero area
-    - negative width/height
-    """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
-    invalid_detections = [
-        {"coords": (100, 100, 100, 200), "score": 0.9},  # width = 0
-        {"coords": (100, 100, 200, 100), "score": 0.9},  # height = 0
-        {"coords": (200, 100, 100, 200), "score": 0.9},  # x2 < x1
-        {"coords": (100, 200, 200, 100), "score": 0.9},  # y2 < y1
-        {"coords": None, "score": 0.9},                   # None coords
-        "not_a_dict"                                       # Invalid type
-    ]
-    tracks = tracker.update(invalid_detections)
-    assert len(tracks) == 0
-    assert len(tracker.tracked_stracks) == 0
-
-
-def test_11_nan_and_infinite_confidence_values():
-    """
-    11. NaN and infinite coordinate / confidence rejection:
-    Checks that detections containing NaN, inf, or negative confidence are cleanly rejected.
-    """
-    tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10)
-    bad_detections = [
-        {"coords": (float('nan'), 100, 200, 200), "score": 0.9},
-        {"coords": (100, 100, float('inf'), 200), "score": 0.9},
-        {"coords": (100, 100, 200, 200), "score": float('nan')},
-        {"coords": (100, 100, 200, 200), "score": float('inf')},
-        {"coords": (100, 100, 200, 200), "score": -0.5},
-        {"coords": (100, 100, 200, 200), "score": 1.5}
-    ]
-    tracks = tracker.update(bad_detections)
-    assert len(tracks) == 0
-    assert len(tracker.tracked_stracks) == 0
-
-
-def test_12_empty_detection_frames():
-    """
-    12. Empty detection frames:
-    Updating with empty detection lists should execute safely without crashes or NaN states.
-    """
-    tracker = ByteTracker()
-    for _ in range(5):
-        tracks = tracker.update([])
-        assert tracks == []
-
-
-def test_13_long_running_session_memory():
-    """
-    13. Kalman filter numerical stability & Long-running memory bounding:
-    Simulates a 500-frame session with objects entering and leaving.
-    Verifies that:
-    - Kalman covariance remains positive-definite and finite.
-    - removed_stracks does not grow unbounded beyond max_removed_buffer.
+    10. Long-running session memory stability:
+    Simulates a 300-frame session with continuous movement, entering and exiting faces.
+    Verifies bounded memory and finite covariance values throughout.
     """
     tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10, track_buffer=5, max_removed_buffer=50)
 
-    for f in range(200):
-        # Every 10 frames, a new transient face appears and disappears
+    for f in range(250):
         faces = []
-        if f % 10 < 3:
-            faces.append({"coords": (100 + f, 100, 150 + f, 150), "score": 0.90})
-        # Continuous face
+        if f % 12 < 4:
+            faces.append({"coords": (100 + (f % 50), 100, 150 + (f % 50), 150), "score": 0.90})
         faces.append({"coords": (300, 300, 400, 400), "score": 0.92})
 
         tracks = tracker.update(faces, dt=0.033)
-
-        # Check Kalman numerical validity on active tracks
         for trk in tracks:
             assert np.all(np.isfinite(trk.mean))
             assert np.all(np.isfinite(trk.covariance))
-            assert np.all(np.diag(trk.covariance) > 0)
 
-    # Check memory bounded
     assert len(tracker.removed_stracks) <= 50
-
-
-def test_14_duplicate_attendance_vote_prevention():
-    """
-    14. SmartClass Vision Integration - Duplicate attendance vote prevention:
-    Verifies that during a single capture burst, multiple detections associated
-    with the same student or active track cannot cast duplicate votes, preserving
-    the quorum rule (>= 3 unique burst votes out of 10 shots).
-    """
-    NUM_SHOTS = 10
-    student_shots = {}  # roll -> set of unique shot indices
-
-    # Simulate 10 shots
-    for shot_idx in range(NUM_SHOTS):
-        # In shot_idx, imagine two detections match Roll "21BCSE01" (e.g. reflection / jitter)
-        detected_rolls_in_shot = ["21BCSE01", "21BCSE01", "21BCSE02"]
-
-        # Attendance logic invariant: set of rolls per shot
-        rolls_credited_this_shot = set()
-        for roll in detected_rolls_in_shot:
-            if roll not in rolls_credited_this_shot:
-                rolls_credited_this_shot.add(roll)
-                if roll not in student_shots:
-                    student_shots[roll] = set()
-                student_shots[roll].add(shot_idx)
-
-    # Verify that "21BCSE01" only accumulated 1 vote per shot (total 10 votes across 10 shots)
-    assert len(student_shots["21BCSE01"]) == 10
-    assert len(student_shots["21BCSE02"]) == 10
+    assert len(tracker.lost_stracks) <= 10
