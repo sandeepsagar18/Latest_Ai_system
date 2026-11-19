@@ -46,7 +46,17 @@ An automated, ultra-fast **AI-Powered Face Recognition Attendance & Classroom Ma
 - **Dual-State Persistence**: Automatically logs explicit **`Present`** and **`Absent`** records for all section-enrolled candidates.
 - **Itemized Completion Dialog**: Displays verified attendees alongside discarded wrong-section students with their actual enrolled classes.
 
-### 6. Enterprise Security & Cryptographic Integrity
+### 6. Production Model Architecture & Footprint
+
+The system relies strictly on a minimal, highly optimized trio of production ONNX models (all auxiliary/unused models like 3D mesh `1k3d68`, 106-point `2d106det`, and gender/age classifiers have been eliminated to keep the repository lightweight):
+
+| Production Model | ONNX Weight File | Architecture | Purpose in SmartClass Vision |
+| :--- | :--- | :--- | :--- |
+| **SCRFD-2.5GF** | `det_2.5g.onnx` | Anchor-free FPN detector | Ultra-fast back-row student face detection down to 20x20 px and 5-point landmark extraction |
+| **ArcFace ResNet-50** | `w600k_r50.onnx` | ResNet-50 (WebFace600K) | 512-D hyperspherical biometric embeddings with additive angular margin cosine matching |
+| **MiniFASNetV2** | `minifasnet_v2.onnx` | Deep PAD ConvNet | Neural anti-spoofing against digital displays (phones, tablets, laptops) and 2D printed photographs |
+
+### 7. Enterprise Security & Cryptographic Integrity
 - **HMAC-SHA256 Tamper-Proof Checksums**: Generates a cryptographic signature for every attendance session CSV file using teacher identity metadata and system salt.
 - **Role-Based Access Control (RBAC)**: Secure password hashing via PBKDF2-SHA256 with individual cryptographic salts.
 
