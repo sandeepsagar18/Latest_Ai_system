@@ -146,8 +146,11 @@ def start_attendance(subject_info=None):
                 tb = trk.tlbr.astype(int)
                 tx1, ty1, tx2, ty2 = tb[0], tb[1], tb[2], tb[3]
                 cv2.rectangle(display_frame, (tx1, ty1), (tx2, ty2), (0, 255, 0), 2)
-                cv2.putText(display_frame, f"ID:{trk.track_id}", (tx1, max(20, ty1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+                # Display tracking ID with contrast background badge
+                id_badge = f"TRACK #{trk.track_id}"
+                cv2.rectangle(display_frame, (tx1, max(0, ty1 - 22)), (tx1 + len(id_badge) * 11 + 6, max(22, ty1)), (0, 180, 0), -1)
+                cv2.putText(display_frame, id_badge, (tx1 + 4, max(16, ty1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
 
             # Pre-shot alert: audio beep & visual border pulse 0.5s before snap
             is_imminent = time_left <= 0.6
@@ -313,6 +316,35 @@ def start_attendance(subject_info=None):
                     if g_roll != "Unknown":
                         # Identified as a registered student belonging to another section/class
                         batch_matches[orig_batch_idx] = (g_roll, g_conf, g_diag)
+
+            # Map recognition outcomes onto active ByteTrack trajectories
+            for trk in active_shot_tracks:
+                trk_box = trk.tlbr
+                # Find best overlapping crop in current shot
+                best_iou = 0.0
+                best_crop_idx = -1
+                for c_idx, item_info in enumerate(valid_live_crops):
+                    c_box = item_info["coords"]
+                    # Calculate IoU between track bbox and crop coords
+                    ix1 = max(trk_box[0], c_box[0])
+                    iy1 = max(trk_box[1], c_box[1])
+                    ix2 = min(trk_box[2], c_box[2])
+                    iy2 = min(trk_box[3], c_box[3])
+                    iw = max(0.0, ix2 - ix1)
+                    ih = max(0.0, iy2 - iy1)
+                    inter = iw * ih
+                    area1 = max(1.0, (trk_box[2] - trk_box[0]) * (trk_box[3] - trk_box[1]))
+                    area2 = max(1.0, (c_box[2] - c_box[0]) * (c_box[3] - c_box[1]))
+                    iou = inter / (area1 + area2 - inter)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_crop_idx = c_idx
+
+                if best_iou > 0.50 and best_crop_idx >= 0:
+                    matched_roll = batch_matches[best_crop_idx][0]
+                    if matched_roll != "Unknown":
+                        trk.student_id = matched_roll
+                        trk.verified_confidence = batch_matches[best_crop_idx][1]
 
             for item_idx, match_res in enumerate(batch_matches):
                 roll_number = match_res[0]
