@@ -123,7 +123,7 @@ def start_attendance(subject_info=None):
         cv2.waitKey(1)
 
     # Initialize ByteTracker for robust multi-face tracking across preview and capture frames
-    byte_tracker = ByteTracker(track_thresh=0.50, match_thresh=0.70, track_buffer=30)
+    byte_tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10, match_thresh=0.70, track_buffer=30)
 
     for i in range(NUM_SHOTS):
         start_wait = time.time()
@@ -219,7 +219,7 @@ def start_attendance(subject_info=None):
     spoof_incidents = 0
 
     # ByteTracker for multi-frame identity association across the 10 captured shots
-    capture_tracker = ByteTracker(track_thresh=0.50, match_thresh=0.70, track_buffer=10)
+    capture_tracker = ByteTracker(track_thresh=0.50, low_thresh=0.10, match_thresh=0.70, track_buffer=10)
 
     for f_idx, frame in enumerate(captured_frames):
         # Update live visual progress window
